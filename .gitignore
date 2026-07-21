@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ML artifacts
+*.pt
+*.pth
+*.onnx
+*.ckpt
+datasets/
+runs/
+
+# Media - ویدیوهای تست سنگین
+*.mp4
+*.avi
+*.mov
+
+# Env / secrets
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

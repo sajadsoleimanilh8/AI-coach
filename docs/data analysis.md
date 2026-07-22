@@ -1,6 +1,6 @@
-# C. Analysis Logic Design (v3 — Production-Ready)
+#  Analysis Logic Design 
 
-## Changelog from v2
+## Changelog 
 - Added a **standard output contract** every score returns — required so the API/DB schema and frontend don't each invent their own shape.
 - Fixed **division-by-zero risks** in Press Resistance, Formation, and xG-adjacent formulas (all now guarded, with defined behavior at zero-sample).
 - Homography and team assignment are no longer treated as binary "done/not done" — both now carry their own **confidence score** that propagates downstream, since a bad calibration is worse than no calibration (it produces confident-looking garbage).

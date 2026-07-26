@@ -16,7 +16,7 @@ from backend.api.schemas import (
 )
 from backend.database.models import AnalysisResult, ProcessingJob, ProcessingStatus, Video, new_id
 from backend.database.session import Base, engine, get_db
-
+from backend.tasks import process_video_job
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 UPLOAD_DIR = PROJECT_ROOT / "storage" / "uploads"
@@ -97,6 +97,8 @@ def upload_video(
     db.add(job)
     db.commit()
     db.refresh(job)
+
+    process_video_job.delay(job.id)
 
     return VideoUploadResponse(
         video_id=video.id,

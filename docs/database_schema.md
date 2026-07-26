@@ -152,4 +152,8 @@ Summary of Fixes (traceability)
 4	TeamMetric.confidence: Float vs PlayerMetric.confidence: String	TeamMetric.confidence changed to String enum; raw float moved to new confidence_score field
 5	TeamMetric missing method and sub_scores	Added, so Team Rating/xG can declare method for judge transparency same as player-level metrics
 
+<<<<<<< HEAD
 This document supersedes docs/database_schema.md, docs/tracking_system_design.md's §9 schema section, and docs/event_detection.md's "Database Events Table" section. Those docs' non-schema content (algorithm choice, pipeline stages, module structure) is still valid and unaffected.
+=======
+This document supersedes docs/database_schema.md, docs/tracking_system_design.md's §9 schema section, and docs/event_detection.md's "Database Events Table" section. Those docs' non-schema content (algorithm choice, pipeline stages, module structure) is still valid and unaffected.
+>>>>>>> d5cb07546c131118fecba674c2802f3eeb586b11

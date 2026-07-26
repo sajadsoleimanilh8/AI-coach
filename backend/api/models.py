@@ -18,16 +18,6 @@ class ProcessingStatus(str, enum.Enum):
     completed = "completed"
     failed = "failed"
 
-class MetricMethod(str, enum.Enum):
-    ml_trained = "ml_trained"
-    deterministic = "deterministic"
-    heuristic_proxy = "heuristic_proxy"
-
-
-class MetricConfidence(str, enum.Enum):
-    normal = "normal"
-    low_sample = "low_sample"
-    low_upstream_confidence = "low_upstream_confidence"
 
 class MetricMethod(str, enum.Enum):
     ml_trained = "ml_trained"
@@ -39,6 +29,7 @@ class MetricConfidence(str, enum.Enum):
     normal = "normal"
     low_sample = "low_sample"
     low_upstream_confidence = "low_upstream_confidence"
+
 
 class Video(Base):
     __tablename__ = "videos"
@@ -135,14 +126,14 @@ class PlayerDetection(Base):
 
     detection_id = Column(String(36), primary_key=True, default=new_id)
     frame_id = Column(Integer, ForeignKey("frames.frame_id"), nullable=False, index=True)
-    player_id = Column(Integer, nullable=False) 
-    team_id = Column(String(64), nullable=True)  
-    team_assignment_confidence = Column(Float, nullable=True)  
-    x = Column(Float, nullable=False)  
+    player_id = Column(Integer, nullable=False)
+    team_id = Column(String(64), nullable=True)
+    team_assignment_confidence = Column(Float, nullable=True)
+    x = Column(Float, nullable=False)
     y = Column(Float, nullable=False)
     width = Column(Float, nullable=False)
     height = Column(Float, nullable=False)
-    confidence = Column(Float, nullable=False)  
+    confidence = Column(Float, nullable=False)
 
     frame = relationship("Frame", back_populates="player_detections")
 
@@ -173,19 +164,19 @@ class PlayerTracking(Base):
     __tablename__ = "player_tracking"
 
     tracking_id = Column(String(36), primary_key=True, default=new_id)
-    match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False, index=True) 
+    match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False, index=True)
     player_id = Column(Integer, nullable=False)
     frame_id = Column(Integer, ForeignKey("frames.frame_id"), nullable=False, index=True)
     team_id = Column(String(64), nullable=True)
-    pixel_x = Column(Float, nullable=False)  
+    pixel_x = Column(Float, nullable=False)
     pixel_y = Column(Float, nullable=False)
-    pitch_x_m = Column(Float, nullable=True)  
+    pitch_x_m = Column(Float, nullable=True)
     pitch_y_m = Column(Float, nullable=True)
     homography_confidence = Column(Float, nullable=True)
-    
+
     speed = Column(Float, nullable=True)
-    distance = Column(Float, nullable=True)  
-    acceleration = Column(Float, nullable=True)  
+    distance = Column(Float, nullable=True)
+    acceleration = Column(Float, nullable=True)
 
     match = relationship("Match", back_populates="player_trackings")
     frame = relationship("Frame", back_populates="player_trackings")
@@ -202,15 +193,15 @@ class Event(Base):
     event_id = Column(String(36), primary_key=True, default=new_id)
     match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False, index=True)
     frame_id = Column(Integer, ForeignKey("frames.frame_id"), nullable=True, index=True)
-    event_type = Column(String(64), nullable=False)  
-    player_id = Column(Integer, nullable=True)  
-    related_player_id = Column(Integer, nullable=True)  
-    team_id = Column(String(64), nullable=True)  
+    event_type = Column(String(64), nullable=False)
+    player_id = Column(Integer, nullable=True)
+    related_player_id = Column(Integer, nullable=True)
+    team_id = Column(String(64), nullable=True)
     pitch_x_m = Column(Float, nullable=True)
     pitch_y_m = Column(Float, nullable=True)
     homography_confidence = Column(Float, nullable=True)
-    timestamp = Column(Float, nullable=False)  
-    
+    timestamp = Column(Float, nullable=False)
+
     metadata_json = Column("metadata", JSON, nullable=True)
 
     match = relationship("Match", back_populates="events")
@@ -233,12 +224,12 @@ class PlayerMetric(Base):
     metric_id = Column(String(36), primary_key=True, default=new_id)
     match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False, index=True)
     player_id = Column(Integer, nullable=False)
-    metric_name = Column(String(120), nullable=False)  
+    metric_name = Column(String(120), nullable=False)
     value = Column(Float, nullable=True)
-    method = Column(Enum(MetricMethod), nullable=False)  
-    confidence = Column(String(MetricConfidence), nullable=False)  
+    method = Column(Enum(MetricMethod), nullable=False)
+    confidence = Column(Enum(MetricConfidence), nullable=False)
     sample_size = Column(Integer, nullable=False)
-    sub_scores = Column(JSON, nullable=False)  
+    sub_scores = Column(JSON, nullable=False)
     computed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     schema_version = Column(String(16), nullable=False)  # e.g. "v3"
 
@@ -262,10 +253,10 @@ class TeamMetric(Base):
     match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False, index=True)
     team_id = Column(String(64), nullable=False)
     metric_name = Column(String(120), nullable=False)
-    value = Column(Float, nullable=True)  
-    method = Column(Enum(MetricMethod), nullable=False)  
-    confidence = Column(String(MetricConfidence), nullable=False) 
-    confidence_score = Column(Float, nullable=True) 
+    value = Column(Float, nullable=True)
+    method = Column(Enum(MetricMethod), nullable=False)
+    confidence = Column(Enum(MetricConfidence), nullable=False)
+    confidence_score = Column(Float, nullable=True)
     sample_size = Column(Integer, nullable=False)
     sub_scores = Column(JSON, nullable=False)
     computed_at = Column(DateTime, default=datetime.utcnow, nullable=False)

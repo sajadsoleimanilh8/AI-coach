@@ -1,8 +1,3 @@
-/**
- * Mock API Layer mirroring backend FastAPI endpoints and database schema contracts.
- */
-
-// Simulated database state
 let mockVideoUpload = null;
 let mockProcessingJob = null;
 

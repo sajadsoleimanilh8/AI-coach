@@ -1,147 +1,155 @@
-# Football Analysis Database Schema
+Football Analysis Database Schema
+Purpose of This Revision
 
-## Overview
+This document merges and reconciles four previously separate docs:
 
-This document defines the core data structures used by the football analysis system.
+docs/database_schema.md
+docs/tracking_system_design.md
+docs/event_detection.md
+docs/data analysis.md (Analysis Logic Design v3)
 
-It connects:
-- Match data
-- Video frames
-- Player and ball detection
-- Tracking information
-- Events
-- Player and team metrics
+Those four were written independently and disagreed with each other on field names, missing fields, and types. This doc is now the single source of truth — if another doc conflicts with this one, this one wins. Five concrete conflicts were found and resolved; each is called out inline below with a FIXED: note so the team can see what changed and why.
 
----
+Entity Relationship Overview
+Match
+ ├─→ Frame
+ │    ├─→ PlayerDetection
+ │    └─→ BallDetection
+ ├─→ PlayerTracking   (derived from PlayerDetection + ByteTrack + Homography)
+ ├─→ Event            (derived from PlayerTracking + BallDetection)
+ ├─→ PlayerMetric     (derived from Event, per Analysis Logic Design v3)
+ └─→ TeamMetric       (derived from Event + PlayerMetric aggregates)
+Match
 
-## Match
+General match information. Unchanged from v1.
 
-General match information.
-
-Fields:
-- match_id: UUID
-- home_team: String
-- away_team: String
-- video_path: String
-- duration: Float
-
----
-
-## Frame
+Field	Type	Notes
+match_id	UUID (PK)	
+home_team	String	
+away_team	String	
+video_path	String	
+duration	Float	seconds
+created_at	DateTime	
+Frame
 
 Processed video frames.
 
-Fields:
-- frame_id: Integer
-- match_id: UUID
-- frame_number: Integer
-- timestamp: Float
+Field	Type	Notes
+frame_id	Integer (PK)	
+match_id	UUID (FK → Match)	
+frame_number	Integer	
+timestamp	Float	seconds from match start
+fps	Float	added — was in tracking_system_design.md's frame input format but missing from the schema table; needed to convert frame_number ↔ timestamp reliably
+PlayerDetection
 
----
+Raw YOLO detection output, one row per player per frame.
 
-## PlayerDetection
+Field	Type	Notes
+detection_id	UUID (PK)	
+frame_id	Integer (FK → Frame)	
+player_id	Integer	ByteTrack-assigned tracking ID, not a stable player identity across matches
+team_id	String, nullable	FIXED (gap #2): was completely absent from PlayerDetection/PlayerTracking in v1, so there was no way to know which team a detected player belonged to at the detection level. Null until team assignment runs.
+team_assignment_confidence	Float, nullable	added. 0–1, from jersey-cluster separation. Per Analysis Logic Design v3 §0.2: treat team_id as unassigned if this is below TEAM_ASSIGNMENT_CONFIDENCE_MIN (0.5), even if team_id itself is non-null.
+x, y, width, height	Float	pixel-space bounding box
+confidence	Float	YOLO detection confidence, 0–1
+BallDetection
 
-YOLO detection outputs.
+Ball detection output, one row per frame (or per candidate, if multiple).
 
-Fields:
-- detection_id: UUID
-- frame_id: Integer
-- player_id: Integer
-- x: Float
-- y: Float
-- width: Float
-- height: Float
-- confidence: Float
+Field	Type	Notes
+detection_id	UUID (PK)	added — v1 had no primary key on this table
+frame_id	Integer (FK → Frame)	
+ball_x, ball_y	Float	pixel-space
+confidence	Float	
+PlayerTracking
 
----
+Continuous player trajectories, one row per player per frame, in both pixel and pitch coordinates.
 
-## BallDetection
+Field	Type	Notes
+tracking_id	UUID (PK)	added — v1 had no primary key
+match_id	UUID (FK → Match)	added, denormalized for query performance (avoids joining through Frame for every match-level aggregate)
+player_id	Integer	
+frame_id	Integer (FK → Frame)	
+team_id	String, nullable	FIXED (gap #2) — same reasoning as PlayerDetection
+pixel_x, pixel_y	Float	raw tracked position, kept for debugging/re-calibration
+pitch_x_m, pitch_y_m	Float, nullable	renamed from pitch_x_meter/pitch_y_meter (v1 naming) to match the _m suffix convention used throughout Analysis Logic Design v3. Nullable because homography may fail for a given frame.
+homography_confidence	Float, nullable	FIXED (gap #2), critical: this field was entirely missing from every prior doc despite Analysis Logic Design v3 §0.2 explicitly requiring it. Per v3: if this is below HOMOGRAPHY_CONFIDENCE_MIN (0.6), pitch_x_m/pitch_y_m must be treated as unusable by any downstream consumer.
+speed	Float	m/s, computed from consecutive pitch_x_m/pitch_y_m — null if homography unavailable for either endpoint
+distance	Float	meters, cumulative or per-frame-delta (pick one convention — recommend per-frame-delta, sum in queries)
+acceleration	Float	added — tracking_system_design.md §7 defines this formula and lists it as used for sprint load / fatigue, but it was missing from that same doc's own schema table (§9)
+Event
 
-Ball detection outputs.
+Detected match events (pass, shot, touch, turnover, press, etc.).
 
-Fields:
-- frame_id: Integer
-- ball_x: Float
-- ball_y: Float
-- confidence: Float
+FIXED (gap #1): database_schema.md and event_detection.md each defined this table differently — one had metadata: JSON with no match_id, the other had extra_data with match_id. Unified below; match_id is kept (needed for match-scoped queries without joining through Frame every time), and the JSON field is standardized as metadata (matches the naming used in Analysis Logic Design v3's output contract for consistency with PlayerMetric.sub_scores style).
 
----
+Field	Type	Notes
+event_id	UUID (PK)	
+match_id	UUID (FK → Match)	unified — present in both source docs' intent, now explicit
+frame_id	Integer (FK → Frame), nullable	anchors the event to a specific frame for replay/debugging
+event_type	String	pass, shot, first_touch, turnover, press, etc.
+player_id	Integer, nullable	primary actor (e.g. shooter, passer, presser)
+related_player_id	Integer, nullable	added — e.g. pass target (player_to), turnover winner (won_by). v1's per-event-type JSON examples (player_from/player_to, lost_by/won_by) had no consistent column for this; without it, every event type needs a different query pattern.
+team_id	String, nullable	team of player_id at time of event
+pitch_x_m, pitch_y_m	Float, nullable	event location, pitch coordinates
+homography_confidence	Float, nullable	added, same reasoning as PlayerTracking — an event's location is only as trustworthy as the homography that produced it
+timestamp	Float	seconds from match start
+metadata	String name, JSON type	unified field name (was metadata in one doc, extra_data in the other — standardized on metadata)
+PlayerMetric
 
-## PlayerTracking
+Analysis engine output, one row per player per metric per match. This table's shape is fixed exactly to the standard output contract defined in Analysis Logic Design v3 §0.3 — do not add ad hoc fields per metric type; everything metric-specific goes in sub_scores.
 
-Player movement trajectories.
+FIXED (gap #3): v1's PlayerMetric was missing sample_size, computed_at, and schema_version, all three of which v3 §0.3 requires. Without sample_size, there is no way to distinguish a low_sample score from a fully-trusted one in the database — the frontend would have nothing to display for that distinction even though Analysis Logic Design v3 treats it as central to judge-facing credibility.
 
-Fields:
-- player_id: Integer
-- frame_id: Integer
-- pitch_x_meter: Float
-- pitch_y_meter: Float
-- speed: Float
-- distance: Float
+Field	Type	Notes
+metric_id	UUID (PK)	added — v1 had no primary key
+match_id	UUID (FK → Match)	added — v1's PlayerMetric had no match scoping, which breaks multi-match player history (needed for ACWR in Injury Risk Phase 2)
+player_id	Integer	
+metric_name	String	e.g. first_touch_score, press_resistance_score, injury_risk_score
+value	Float, nullable	important: per v3 §0.6/§0.7, a score can legitimately be null (e.g. zero pressured possessions) — this must not default to 0, which would misrepresent "not measured" as "measured and bad"
+method	String	ml_trained | deterministic | heuristic_proxy
+confidence	String	normal | low_sample | low_upstream_confidence
+sample_size	Integer	added (fixes gap #3)
+sub_scores	JSON	component breakdown, e.g. {"control": 76.0, "retention": 100.0, ...}
+computed_at	DateTime	added (fixes gap #3)
+schema_version	String	added (fixes gap #3) — e.g. "v3", so formula changes don't silently corrupt historical comparisons
+TeamMetric
 
----
+Team-level analysis output, one row per team per metric per match.
 
-## Event
+FIXED (gap #4 and #5): v1 had confidence: Float here but confidence: String on PlayerMetric — an inconsistent type for conceptually the same field. v1's TeamMetric was also missing method and sub_scores entirely, even though Analysis Logic Design v3 explicitly requires every score — including Team Rating and xG — to declare its method for the judge-facing transparency split (ML-trained vs. deterministic vs. heuristic). TeamMetric is now structurally identical to PlayerMetric except player_id → team_id, which also makes the DB layer and API serialization code shareable between the two instead of duplicated.
 
-Detected football events.
+Field	Type	Notes
+metric_id	UUID (PK)	added
+match_id	UUID (FK → Match)	added
+team_id	String	
+metric_name	String	e.g. formation, possession, team_rating
+value	Float, nullable	
+method	String	added (fixes gap #5) — ml_trained | deterministic | heuristic_proxy
+confidence	String	FIXED (gap #4): was Float in v1, now String enum, matching PlayerMetric
+confidence_score	Float, nullable	added — if a raw 0–1 confidence number is also needed (e.g. Formation Detection's exp(-distance_score/...) value from Analysis Logic Design v3 §3), it lives here separately from the categorical confidence enum, so neither use case forces the other into the wrong type
+sample_size	Integer	added, for consistency with PlayerMetric
+sub_scores	JSON	added (fixes gap #5)
+computed_at	DateTime	
+schema_version	String	
+Relationships (updated)
+Match
+ ├─→ Frame
+ │     ├─→ PlayerDetection  (team_id, team_assignment_confidence)
+ │     └─→ BallDetection
+ ├─→ PlayerTracking  (team_id, pitch_x_m/y_m, homography_confidence)
+ ├─→ Event  (team_id, pitch_x_m/y_m, homography_confidence, related_player_id)
+ ├─→ PlayerMetric  (method, confidence, sample_size, sub_scores, schema_version)
+ └─→ TeamMetric    (method, confidence, confidence_score, sample_size, sub_scores, schema_version)
 
-Examples:
-- pass
-- shot
-- touch
-- possession change
+team_id and homography_confidence now flow through every table from PlayerDetection onward, so any downstream consumer (Analysis Logic Design v3's scoring functions) can resolve confidence without a separate lookup.
 
-Fields:
-- event_id: UUID
-- player_id: Integer
-- event_type: String
-- timestamp: Float
-- metadata: JSON
+Summary of Fixes (traceability)
+#	Conflict	Resolution
+1	Event.metadata vs Event.extra_data, match_id present in only one version	Unified: match_id kept, JSON field named metadata
+2	No team_id or homography_confidence anywhere in detection/tracking tables	Added to PlayerDetection, PlayerTracking, and Event
+3	PlayerMetric missing sample_size, computed_at, schema_version	Added, matching Analysis Logic Design v3 §0.3 output contract exactly
+4	TeamMetric.confidence: Float vs PlayerMetric.confidence: String	TeamMetric.confidence changed to String enum; raw float moved to new confidence_score field
+5	TeamMetric missing method and sub_scores	Added, so Team Rating/xG can declare method for judge transparency same as player-level metrics
 
----
-
-## PlayerMetric
-
-Analysis engine outputs.
-
-Fields:
-- player_id: Integer
-- metric_name: String
-- value: Float
-- method: String
-- confidence: String
-- sub_scores: JSON
-
-Examples:
-- first_touch_score
-- press_resistance
-- injury_risk
-
----
-
-## TeamMetric
-
-Team-level analysis outputs.
-
-Fields:
-- team_id: Integer
-- metric_name: String
-- value: Float
-- confidence: Float
-
-Examples:
-- formation
-- possession
-- team_rating
-
----
-
-## Relationships
-
-Match  
-→ Frame  
-→ PlayerDetection  
-→ BallDetection  
-→ PlayerTracking  
-→ Event  
-→ PlayerMetric / TeamMetric
+This document supersedes docs/database_schema.md, docs/tracking_system_design.md's §9 schema section, and docs/event_detection.md's "Database Events Table" section. Those docs' non-schema content (algorithm choice, pipeline stages, module structure) is still valid and unaffected.

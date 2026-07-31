@@ -12,7 +12,7 @@ import cv2
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=r"D:\SportsStrategyCoachAI\runs\runs\player_ball_v1-4\weights\best.pt", help="Path to best.pt")
-    parser.add_argument("--video", default=r"D:\SportsStrategyCoachAI\SportsStrategyCoachAI\19.mp4", help="Path to match video")
+    parser.add_argument("--video", default=r"D:\SportsStrategyCoachAI\SportsStrategyCoachAI\test.mp4", help="Path to match video")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--max-frames", type=int, default=None)
     args = parser.parse_args()

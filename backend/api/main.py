@@ -1,10 +1,17 @@
-import shutil
 import json
+import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
+# Ensure project root is in sys.path (Note the index below)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from backend.api.schemas import (
@@ -18,26 +25,26 @@ from backend.database.models import AnalysisResult, ProcessingJob, ProcessingSta
 from backend.database.session import Base, engine, get_db
 from backend.tasks import process_video_job
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-UPLOAD_DIR = PROJECT_ROOT / "storage" / "uploads"
-ALLOWED_VIDEO_TYPES = {
-    "video/mp4",
-    "video/mpeg",
-    "video/quicktime",
-    "video/x-msvideo",
-    "application/octet-stream",
-}
+# Storage paths must exist BEFORE app.mount() runs (mount happens at import
+# time, not at the "startup" event, so creating the dir inside startup()
+# is too late and StaticFiles() raises RuntimeError on a missing directory).
+STORAGE_DIR = PROJECT_ROOT / "storage"
+UPLOAD_DIR = STORAGE_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# 1. Create FastAPI App Instance
 app = FastAPI(
     title="SportsStrategyCoachAI Backend",
     version="0.1.0",
     description="Video upload, processing status, and analysis JSON API.",
 )
 
+# 2. Mount Static Storage Directory for Video Playback
+app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
+
 
 @app.on_event("startup")
 def startup():
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
 
 
@@ -46,46 +53,43 @@ def health():
     return {"status": "ok", "service": "sports-strategy-coach-ai"}
 
 
+# Video Upload Endpoint
 @app.post("/api/videos/upload", response_model=VideoUploadResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/api/videos/upload/", response_model=VideoUploadResponse, status_code=status.HTTP_201_CREATED)
 def upload_video(
     file: Annotated[UploadFile, File()],
     metadata: Annotated[str | None, Form()] = None,
     db: Session = Depends(get_db),
 ):
-    if file.content_type not in ALLOWED_VIDEO_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported file type: {file.content_type}",
-        )
-
     metadata_json = None
-    if metadata:
+    if metadata and metadata.strip() and metadata.strip().lower() != "string":
         try:
             metadata_json = json.loads(metadata)
-        except json.JSONDecodeError as error:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"metadata must be valid JSON: {error.msg}",
-            ) from error
+        except json.JSONDecodeError:
+            metadata_json = {"raw_metadata": metadata}
 
     file_id = new_id()
     extension = Path(file.filename or "video.mp4").suffix or ".mp4"
     stored_filename = f"{file_id}{extension.lower()}"
     storage_path = UPLOAD_DIR / stored_filename
 
+    # Save uploaded video
     with storage_path.open("wb") as output:
         shutil.copyfileobj(file.file, output)
 
     file_size = storage_path.stat().st_size
+
+    # Create Database Records
     video = Video(
         id=file_id,
         original_filename=file.filename or stored_filename,
         stored_filename=stored_filename,
-        content_type=file.content_type,
+        content_type=file.content_type or "video/mp4",
         file_size=file_size,
         storage_path=str(storage_path),
         metadata_json=metadata_json,
     )
+
     job = ProcessingJob(
         video_id=video.id,
         status=ProcessingStatus.queued,
@@ -98,6 +102,7 @@ def upload_video(
     db.commit()
     db.refresh(job)
 
+    # Queue Celery processing task
     process_video_job.delay(job.id)
 
     return VideoUploadResponse(
@@ -109,12 +114,13 @@ def upload_video(
     )
 
 
+# Get Processing Job Status
 @app.get("/api/processing/{job_id}", response_model=ProcessingStatusResponse)
+@app.get("/api/processing/{job_id}/", response_model=ProcessingStatusResponse)
 def get_processing_status(job_id: str, db: Session = Depends(get_db)):
     job = db.get(ProcessingJob, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processing job not found")
-
     return ProcessingStatusResponse(
         job_id=job.id,
         video_id=job.video_id,
@@ -129,7 +135,9 @@ def get_processing_status(job_id: str, db: Session = Depends(get_db)):
     )
 
 
+# Update Processing Job Status (Worker Endpoint)
 @app.patch("/api/processing/{job_id}", response_model=ProcessingStatusResponse)
+@app.patch("/api/processing/{job_id}/", response_model=ProcessingStatusResponse)
 def update_processing_status(job_id: str, payload: JobStatusUpdate, db: Session = Depends(get_db)):
     job = db.get(ProcessingJob, job_id)
     if not job:
@@ -164,7 +172,9 @@ def update_processing_status(job_id: str, payload: JobStatusUpdate, db: Session 
     )
 
 
+# Save Analysis Result
 @app.post("/api/processing/{job_id}/result", response_model=AnalysisResultResponse)
+@app.post("/api/processing/{job_id}/result/", response_model=AnalysisResultResponse)
 def save_analysis_result(job_id: str, payload: AnalysisResultCreate, db: Session = Depends(get_db)):
     job = db.get(ProcessingJob, job_id)
     if not job:
@@ -196,7 +206,9 @@ def save_analysis_result(job_id: str, payload: AnalysisResultCreate, db: Session
     )
 
 
+# Get Analysis Result JSON
 @app.get("/api/processing/{job_id}/result", response_model=AnalysisResultResponse)
+@app.get("/api/processing/{job_id}/result/", response_model=AnalysisResultResponse)
 def get_analysis_result(job_id: str, db: Session = Depends(get_db)):
     job = db.get(ProcessingJob, job_id)
     if not job:

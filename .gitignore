@@ -29,3 +29,5 @@ Thumbs.db
 .vscode/
 .idea/
 backend/database/sports_strategy.db
+node_modules/
+frontend/web/node_modules/

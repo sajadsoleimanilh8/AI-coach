@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -41,6 +42,21 @@ app = FastAPI(
 
 # 2. Mount Static Storage Directory for Video Playback
 app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
+
+# 3. CORS — the Vite dev server (localhost:3000) and the FastAPI backend
+# (localhost:8000) are different origins, so browser fetch() calls from
+# realClient.js get blocked without this, even though curl/Postman never
+# show the problem (browsers are the only thing that enforce CORS).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -102,8 +118,23 @@ def upload_video(
     db.commit()
     db.refresh(job)
 
-    # Queue Celery processing task
-    process_video_job.delay(job.id)
+    # Queue Celery processing task.
+    # If the broker (Redis) is unreachable, Kombu's producer will otherwise
+    # block/retry for a long time and the request just hangs with no
+    # feedback — fail fast instead so a missing "redis-server.exe" shows up
+    # immediately as a clear error rather than a stuck spinner during a demo.
+    try:
+        process_video_job.delay(job.id)
+    except Exception as error:
+        job.status = ProcessingStatus.failed
+        job.error = f"Could not reach task broker (Redis): {error}"
+        job.updated_at = datetime.utcnow()
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Processing queue is unavailable (Redis/Celery broker unreachable). "
+                   "Start Redis and try again.",
+        ) from error
 
     return VideoUploadResponse(
         video_id=video.id,

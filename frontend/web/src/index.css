@@ -6,7 +6,7 @@
   --text-muted: #94a3b8;
   --accent-blue: #38bdf8;
   --border-color: #334155;
-  
+
   /* Confidence level styling */
   --conf-normal-bg: #065f46;
   --conf-normal-fg: #6ee7b7;
@@ -14,6 +14,13 @@
   --conf-sample-fg: #fde047;
   --conf-upstream-bg: #991b1b;
   --conf-upstream-fg: #fca5a5;
+  /* FIXED (Phase 3 audit): "not yet computed" is a distinct state from
+     "computed with low sample size" -- conflating them (e.g. showing a
+     yellow low_sample badge for a metric that was never attempted) hides
+     the difference between "the model isn't confident" and "the pipeline
+     hasn't run for this match yet." Neutral gray, not alarming amber/red. */
+  --conf-not-computed-bg: #1e293b;
+  --conf-not-computed-fg: #64748b;
 }
 
 body {
@@ -150,6 +157,12 @@ body {
   color: var(--conf-upstream-fg);
 }
 
+.badge-not_computed {
+  background-color: var(--conf-not-computed-bg);
+  color: var(--conf-not-computed-fg);
+  border: 1px dashed var(--border-color);
+}
+
 .subscores-list {
   margin-top: 0.75rem;
   padding-top: 0.75rem;
@@ -244,4 +257,54 @@ body {
 
 .status-error {
   color: #ef4444;
+}
+
+/* ---- Phase 3 additions: formation pitch + weak-zone heatmap ---- */
+/* New, not a restoration -- needed for the formation diagram and
+   weak-zone heatmap overlay deliverables. Reuses the same pitch SVG
+   markup for both (see PitchVisual in TabTeamIntelligence.jsx) so they
+   share one visual language instead of two bespoke widgets. */
+
+.pitch-wrap {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.pitch-svg {
+  width: 100%;
+  height: auto;
+  background-color: #14532d;
+  border-radius: 4px;
+}
+
+.pitch-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 240px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 1rem;
+}
+
+.demo-banner {
+  background-color: var(--conf-sample-bg);
+  color: var(--conf-sample-fg);
+  border-radius: 6px;
+  padding: 0.6rem 1rem;
+  font-size: 0.8rem;
+  margin-bottom: 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.radar-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 0.5rem 0;
 }

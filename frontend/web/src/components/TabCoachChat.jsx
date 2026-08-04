@@ -1,57 +1,69 @@
 import React, { useState } from 'react';
 import { mockApi } from '../api/mockClient';
 
-export default function TabCoachChat() {
+export default function TabCoachChat({ matchId }) {
   const [messages, setMessages] = useState([
-    { sender: 'assistant', text: 'Ask me about tactics, player performance, or match analysis.' }
+    {
+      id: 1,
+      sender: 'assistant',
+      text: 'Hello Coach! I am your AI Strategy Consultant. Ask me about formation stability, press resistance, or player positioning.'
+    }
   ]);
   const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = async (e) => {
+  const handleSend = async (e) => {
     e.preventDefault();
-    const text = input.trim();
-    if (!text || sending) return;
+    if (!input.trim() || loading) return;
 
-    setMessages(prev => [...prev, { sender: 'user', text }]);
+    const userMsg = { id: Date.now(), sender: 'user', text: input };
+    setMessages((prev) => [...prev, userMsg]);
+    const queryText = input;
     setInput('');
-    setSending(true);
+    setLoading(true);
 
     try {
-      const reply = await mockApi.sendChatMessage(text);
-      setMessages(prev => [...prev, reply]);
+      const response = await mockApi.sendChatMessage(queryText);
+      const assistantMsg = { id: Date.now() + 1, sender: 'assistant', text: response.text };
+      setMessages((prev) => [...prev, assistantMsg]);
     } catch (err) {
-      setMessages(prev => [...prev, { sender: 'assistant', text: `Error: ${err.message}` }]);
+      setMessages((prev) => [
+        ...prev,
+        { id: Date.now() + 1, sender: 'assistant', text: 'Error connecting to Coach Chat assistant.' }
+      ]);
     } finally {
-      setSending(false);
+      setLoading(false);
     }
   };
 
   return (
     <div>
-      <h2>Coach Chat</h2>
-      <p className="metric-meta">Ask the AI coach about tactics, players, and match events.</p>
+      <h2>Coach Chat Assistant</h2>
+      <p className="metric-meta">
+        Interactive tactical & player intelligence consultation.
+        {matchId && matchId !== 'demo' && <> Scoped to match <code>{matchId}</code>.</>}
+      </p>
 
       <div className="chat-box">
         <div className="messages-list">
-          {messages.map((m, i) => (
-            <div key={i} className={`message ${m.sender}`}>
-              {m.text}
+          {messages.map((m) => (
+            <div key={m.id} className={`message ${m.sender}`}>
+              <strong>{m.sender === 'user' ? 'Coach' : 'AI Assistant'}:</strong>
+              <div>{m.text}</div>
             </div>
           ))}
-          {sending && <div className="message assistant">Thinking...</div>}
+          {loading && <div className="metric-meta">AI Assistant is analyzing query...</div>}
         </div>
 
-        <form className="chat-input-form" onSubmit={handleSubmit}>
+        <form onSubmit={handleSend} className="chat-input-form">
           <input
-            className="chat-input"
             type="text"
+            className="chat-input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask about a player, tactic, or match event..."
-            disabled={sending}
+            placeholder="Type your tactical question here..."
           />
-          <button className="btn" type="submit" disabled={sending || !input.trim()}>
+          <button type="submit" className="btn" disabled={loading}>
             Send
           </button>
         </form>

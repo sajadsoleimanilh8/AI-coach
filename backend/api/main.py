@@ -1,66 +1,49 @@
 import json
 import shutil
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
-
-# Ensure project root is in sys.path (Note the index below)
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
+from backend.api import player_intelligence, tactical
 from backend.api.schemas import (
     AnalysisResultCreate,
     AnalysisResultResponse,
     JobStatusUpdate,
+    PipelineLatencyReport,
     ProcessingStatusResponse,
     VideoUploadResponse,
 )
-from backend.database.models import AnalysisResult, ProcessingJob, ProcessingStatus, Video, new_id
+from backend.database.models import AnalysisResult, Match, ProcessingJob, ProcessingStatus, Video, new_id
 from backend.database.session import Base, engine, get_db
 from backend.tasks import process_video_job
 
-# Storage paths must exist BEFORE app.mount() runs (mount happens at import
-# time, not at the "startup" event, so creating the dir inside startup()
-# is too late and StaticFiles() raises RuntimeError on a missing directory).
-STORAGE_DIR = PROJECT_ROOT / "storage"
-UPLOAD_DIR = STORAGE_DIR / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+UPLOAD_DIR = PROJECT_ROOT / "storage" / "uploads"
+ALLOWED_VIDEO_TYPES = {
+    "video/mp4",
+    "video/mpeg",
+    "video/quicktime",
+    "video/x-msvideo",
+    "application/octet-stream",
+}
 
-# 1. Create FastAPI App Instance
 app = FastAPI(
     title="SportsStrategyCoachAI Backend",
     version="0.1.0",
     description="Video upload, processing status, and analysis JSON API.",
 )
 
-# 2. Mount Static Storage Directory for Video Playback
-app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
-
-# 3. CORS — the Vite dev server (localhost:3000) and the FastAPI backend
-# (localhost:8000) are different origins, so browser fetch() calls from
-# realClient.js get blocked without this, even though curl/Postman never
-# show the problem (browsers are the only thing that enforce CORS).
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Register Phase 3 routers
+app.include_router(tactical.router)
+app.include_router(tactical.team_intel_router)
+app.include_router(player_intelligence.router)
 
 
 @app.on_event("startup")
 def startup():
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
 
 
@@ -69,85 +52,92 @@ def health():
     return {"status": "ok", "service": "sports-strategy-coach-ai"}
 
 
-# Video Upload Endpoint
 @app.post("/api/videos/upload", response_model=VideoUploadResponse, status_code=status.HTTP_201_CREATED)
-@app.post("/api/videos/upload/", response_model=VideoUploadResponse, status_code=status.HTTP_201_CREATED)
 def upload_video(
     file: Annotated[UploadFile, File()],
     metadata: Annotated[str | None, Form()] = None,
     db: Session = Depends(get_db),
 ):
+    if file.content_type not in ALLOWED_VIDEO_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type: {file.content_type}",
+        )
     metadata_json = None
-    if metadata and metadata.strip() and metadata.strip().lower() != "string":
+    if metadata:
         try:
             metadata_json = json.loads(metadata)
-        except json.JSONDecodeError:
-            metadata_json = {"raw_metadata": metadata}
-
+        except json.JSONDecodeError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"metadata must be valid JSON: {error.msg}",
+            ) from error
     file_id = new_id()
     extension = Path(file.filename or "video.mp4").suffix or ".mp4"
     stored_filename = f"{file_id}{extension.lower()}"
     storage_path = UPLOAD_DIR / stored_filename
-
-    # Save uploaded video
     with storage_path.open("wb") as output:
         shutil.copyfileobj(file.file, output)
-
     file_size = storage_path.stat().st_size
 
-    # Create Database Records
+    # FIXED (Phase 3 audit): there was previously no link at all between
+    # an uploaded Video and the Match row its PlayerMetric/TeamMetric/Event
+    # rows get written under -- backend/tasks.py had nothing to key its
+    # cache invalidation on, and the dashboard had no way to know which
+    # match_id corresponded to the video it just uploaded (it was hardcoded
+    # to a demo id, "match-999"). Create the Match row here, at the one
+    # point in the system that actually knows this Video exists, and hand
+    # its id back in the upload response so the frontend can carry it
+    # forward to every subsequent /api/*_intelligence/{match_id} call.
+    #
+    # home_team/away_team/duration aren't known at upload time unless the
+    # caller supplies them via `metadata` -- default to honest placeholders
+    # rather than guessing team names; duration gets filled in for real
+    # once the pipeline actually opens the video (see
+    # backend/pipeline/runner.py::_estimate_fps and the corresponding
+    # Match.duration update after ingest).
+    meta = metadata_json or {}
+    match = Match(
+        home_team=meta.get("team", "Home"),
+        away_team=meta.get("opponent", "Away"),
+        video_path=str(storage_path),
+        duration=0.0,
+    )
+    db.add(match)
+    db.flush()  # need match.match_id before constructing Video below
+
     video = Video(
         id=file_id,
         original_filename=file.filename or stored_filename,
         stored_filename=stored_filename,
-        content_type=file.content_type or "video/mp4",
+        content_type=file.content_type,
         file_size=file_size,
         storage_path=str(storage_path),
         metadata_json=metadata_json,
+        match_id=match.match_id,
     )
-
     job = ProcessingJob(
         video_id=video.id,
         status=ProcessingStatus.queued,
         progress=0,
         message="Video uploaded and queued for processing.",
     )
-
     db.add(video)
     db.add(job)
     db.commit()
     db.refresh(job)
-
-    # Queue Celery processing task.
-    # If the broker (Redis) is unreachable, Kombu's producer will otherwise
-    # block/retry for a long time and the request just hangs with no
-    # feedback — fail fast instead so a missing "redis-server.exe" shows up
-    # immediately as a clear error rather than a stuck spinner during a demo.
-    try:
-        process_video_job.delay(job.id)
-    except Exception as error:
-        job.status = ProcessingStatus.failed
-        job.error = f"Could not reach task broker (Redis): {error}"
-        job.updated_at = datetime.utcnow()
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Processing queue is unavailable (Redis/Celery broker unreachable). "
-                   "Start Redis and try again.",
-        ) from error
-
+    process_video_job.delay(job.id)
     return VideoUploadResponse(
         video_id=video.id,
         job_id=job.id,
+        match_id=match.match_id,
         filename=video.original_filename,
         status=job.status.value,
         message=job.message or "Video uploaded.",
     )
 
 
-# Get Processing Job Status
 @app.get("/api/processing/{job_id}", response_model=ProcessingStatusResponse)
-@app.get("/api/processing/{job_id}/", response_model=ProcessingStatusResponse)
 def get_processing_status(job_id: str, db: Session = Depends(get_db)):
     job = db.get(ProcessingJob, job_id)
     if not job:
@@ -155,6 +145,7 @@ def get_processing_status(job_id: str, db: Session = Depends(get_db)):
     return ProcessingStatusResponse(
         job_id=job.id,
         video_id=job.video_id,
+        match_id=job.video.match_id if job.video else None,
         status=job.status.value,
         progress=job.progress,
         message=job.message,
@@ -166,29 +157,25 @@ def get_processing_status(job_id: str, db: Session = Depends(get_db)):
     )
 
 
-# Update Processing Job Status (Worker Endpoint)
 @app.patch("/api/processing/{job_id}", response_model=ProcessingStatusResponse)
-@app.patch("/api/processing/{job_id}/", response_model=ProcessingStatusResponse)
-def update_processing_status(job_id: str, payload: JobStatusUpdate, db: Session = Depends(get_db)):
+def update_processing_status(
+    job_id: str, payload: JobStatusUpdate, db: Session = Depends(get_db)
+):
     job = db.get(ProcessingJob, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processing job not found")
-
     next_status = ProcessingStatus(payload.status)
     job.status = next_status
     job.progress = payload.progress
     job.message = payload.message
     job.error = payload.error
     job.updated_at = datetime.utcnow()
-
     if next_status == ProcessingStatus.processing and job.started_at is None:
         job.started_at = datetime.utcnow()
     if next_status in {ProcessingStatus.completed, ProcessingStatus.failed}:
         job.completed_at = datetime.utcnow()
-
     db.commit()
     db.refresh(job)
-
     return ProcessingStatusResponse(
         job_id=job.id,
         video_id=job.video_id,
@@ -203,31 +190,27 @@ def update_processing_status(job_id: str, payload: JobStatusUpdate, db: Session 
     )
 
 
-# Save Analysis Result
 @app.post("/api/processing/{job_id}/result", response_model=AnalysisResultResponse)
-@app.post("/api/processing/{job_id}/result/", response_model=AnalysisResultResponse)
-def save_analysis_result(job_id: str, payload: AnalysisResultCreate, db: Session = Depends(get_db)):
+def save_analysis_result(
+    job_id: str, payload: AnalysisResultCreate, db: Session = Depends(get_db)
+):
     job = db.get(ProcessingJob, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processing job not found")
-
     existing = db.query(AnalysisResult).filter(AnalysisResult.job_id == job_id).first()
     if existing:
         existing.result_json = payload.result
         existing.summary = payload.summary
     else:
         db.add(AnalysisResult(job_id=job_id, result_json=payload.result, summary=payload.summary))
-
     job.status = ProcessingStatus.completed
     job.progress = 100
     job.message = "Analysis result saved."
     job.error = None
     job.completed_at = datetime.utcnow()
     job.updated_at = datetime.utcnow()
-
     db.commit()
     db.refresh(job)
-
     return AnalysisResultResponse(
         job_id=job.id,
         video_id=job.video_id,
@@ -237,14 +220,11 @@ def save_analysis_result(job_id: str, payload: AnalysisResultCreate, db: Session
     )
 
 
-# Get Analysis Result JSON
 @app.get("/api/processing/{job_id}/result", response_model=AnalysisResultResponse)
-@app.get("/api/processing/{job_id}/result/", response_model=AnalysisResultResponse)
 def get_analysis_result(job_id: str, db: Session = Depends(get_db)):
     job = db.get(ProcessingJob, job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processing job not found")
-
     result = db.query(AnalysisResult).filter(AnalysisResult.job_id == job_id).first()
     return AnalysisResultResponse(
         job_id=job.id,
@@ -253,3 +233,27 @@ def get_analysis_result(job_id: str, db: Session = Depends(get_db)):
         summary=result.summary if result else None,
         result=result.result_json if result else None,
     )
+
+
+@app.get("/api/pipeline/latency/{job_id}", response_model=PipelineLatencyReport)
+def get_pipeline_latency(job_id: str, db: Session = Depends(get_db)):
+    """
+    Serves the REAL per-stage timing captured by backend/pipeline/latency.py
+    during this job's run (backend/tasks.py writes it into
+    AnalysisResult.result_json['pipeline_latency']). See that module's
+    docstring for why "real" is load-bearing here: this replaces a
+    previously fabricated, hand-typed latency doc with numbers that can
+    only exist if this exact job actually ran this exact pipeline code.
+    """
+    job = db.get(ProcessingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processing job not found")
+
+    result = db.query(AnalysisResult).filter(AnalysisResult.job_id == job_id).first()
+    if not result or "pipeline_latency" not in (result.result_json or {}):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No latency report for job_id={job_id} yet -- job may still be processing or failed "
+                   f"before completing a stage.",
+        )
+    return PipelineLatencyReport(**result.result_json["pipeline_latency"])

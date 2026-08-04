@@ -1,181 +1,151 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { realApi } from '../api/realClient';
+import React, { useEffect, useRef, useState } from 'react';
+import { api } from '../api/client';
+import { mockApi } from '../api/mockClient';
 
-export default function TabMatchAnalysis() {
-  const [selectedFile, setSelectedFile] = useState(null);
+/**
+ * FIXED (Phase 3 audit): this tab previously only called mockApi and never
+ * touched the real backend, so a real upload could never happen and
+ * matchId was never threaded anywhere. It now does a real upload against
+ * POST /api/videos/upload, polls the real job status, and hands the real
+ * match_id up to App once the job is created (not once it's *complete* --
+ * the Player/Team Intelligence tabs handle "not computed yet" honestly on
+ * their own, see their empty states).
+ *
+ * "Load Demo Data" is kept as a clearly separate, clearly labeled path
+ * (matchId === 'demo') rather than a silent fallback -- see
+ * TabPlayerIntelligence.jsx / TabTeamIntelligence.jsx's demo-banner
+ * handling. Silently swapping to mock data on failure is exactly what
+ * made the match_id wiring bug invisible during the team's own testing.
+ */
+export default function TabMatchAnalysis({ onMatchReady }) {
+  const [file, setFile] = useState(null);
   const [job, setJob] = useState(null);
-  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const canvasRef = useRef(null);
   const pollRef = useRef(null);
 
-  const handleFileChange = (e) => {
-    if (e.target.files && e.target.files[0]) {
-      setSelectedFile(e.target.files[0]);
-    }
-  };
+  useEffect(() => () => clearInterval(pollRef.current), []);
 
-  const handleUploadAndRun = async () => {
-    if (!selectedFile) {
-      setError('Please choose a video file first.');
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setError(null);
-      setResult(null);
-
-      // 1. Upload the REAL file to FastAPI (multipart/form-data)
-      const uploadRes = await realApi.uploadVideoFile(selectedFile);
-      const initialStatus = await realApi.getProcessingStatus(uploadRes.job_id);
-      setJob({ ...initialStatus, video_id: uploadRes.video_id });
-
-      // 2. Poll the REAL backend every 1.5s until completed/failed.
-      //    Celery is running the actual YOLO + ByteTrack + Homography
-      //    pipeline in the background -- this polls its real progress.
-      if (pollRef.current) clearInterval(pollRef.current);
-
-      pollRef.current = setInterval(async () => {
-        try {
-          const currentStatus = await realApi.getProcessingStatus(uploadRes.job_id);
-          setJob({ ...currentStatus, video_id: uploadRes.video_id });
-
-          if (currentStatus.status === 'completed') {
-            clearInterval(pollRef.current);
-            const resultData = await realApi.getAnalysisResult(uploadRes.job_id);
-            setResult(resultData.result);
-            setLoading(false);
-          } else if (currentStatus.status === 'failed') {
-            clearInterval(pollRef.current);
-            setError(currentStatus.error || 'Processing job failed');
-            setLoading(false);
-          }
-        } catch (e) {
+  const pollStatus = (jobId) => {
+    clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const status = await api.getProcessingStatus(jobId);
+        setJob(status);
+        if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(pollRef.current);
-          setError(e.message);
           setLoading(false);
         }
-      }, 1500);
+      } catch (err) {
+        setError(err.message);
+        clearInterval(pollRef.current);
+        setLoading(false);
+      }
+    }, 2000);
+  };
+
+  const startRealUpload = async () => {
+    if (!file) {
+      setError('Choose a video file first.');
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const uploadRes = await api.uploadVideo(file);
+      setJob({
+        job_id: uploadRes.job_id,
+        match_id: uploadRes.match_id,
+        status: uploadRes.status,
+        progress: 0,
+        message: uploadRes.message,
+      });
+      onMatchReady?.(uploadRes.match_id, uploadRes.job_id);
+      pollStatus(uploadRes.job_id);
     } catch (err) {
       setError(err.message);
       setLoading(false);
     }
   };
 
-  // Cleanup polling on unmount
-  useEffect(() => {
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, []);
-
-  // Draw 2D Pitch Canvas (105m x 68m) & Heatmap Points
-  useEffect(() => {
-    if (!result || !result.heatmap_sample || !canvasRef.current) return;
-
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    const width = canvas.width;
-    const height = canvas.height;
-
-    ctx.clearRect(0, 0, width, height);
-
-    // Pitch Background
-    ctx.fillStyle = '#1b381b';
-    ctx.fillRect(0, 0, width, height);
-
-    // Pitch Boundary Lines
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 2;
-    const pad = 15;
-    const pitchW = width - 2 * pad;
-    const pitchH = height - 2 * pad;
-
-    ctx.strokeRect(pad, pad, pitchW, pitchH);
-
-    // Halfway Line
-    ctx.beginPath();
-    ctx.moveTo(pad + pitchW / 2, pad);
-    ctx.lineTo(pad + pitchW / 2, pad + pitchH);
-    ctx.stroke();
-
-    // Center Circle
-    ctx.beginPath();
-    ctx.arc(pad + pitchW / 2, pad + pitchH / 2, (9.15 / 68.0) * pitchH, 0, 2 * Math.PI);
-    ctx.stroke();
-
-    // Render Heatmap Spatial Points
-    result.heatmap_sample.forEach((pt) => {
-      const px = pad + (pt.x / 105.0) * pitchW;
-      const py = pad + (pt.y / 68.0) * pitchH;
-
-      ctx.beginPath();
-      ctx.arc(px, py, 7, 0, 2 * Math.PI);
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.45)'; // Cyan Spatial Glow
-      ctx.fill();
-    });
-  }, [result]);
+  const loadDemoData = async () => {
+    setError(null);
+    setLoading(true);
+    const uploadRes = await mockApi.uploadVideo('match_clip_first_half.mp4');
+    const statusRes = await mockApi.getProcessingStatus(uploadRes.job_id);
+    setJob(statusRes);
+    setLoading(false);
+    // 'demo' is a sentinel matchId every tab recognizes as "show mock
+    // data behind an explicit demo-mode banner" -- never confused with a
+    // real match_id (real ones are UUIDs from the Match table).
+    onMatchReady?.('demo', null);
+  };
 
   return (
     <div>
-      <h2>Match Analysis & Spatial Tracking Pipeline</h2>
-      <p>Upload a match clip to execute YOLO detection, ByteTrack tracking, and Pitch Homography calibration.</p>
+      <h2>Match Analysis (Video Processing)</h2>
+      <p className="metric-meta">
+        Upload a real match clip to run the actual pipeline (detection, tracking, homography,
+        event heuristics, tactical &amp; player scoring), or load demo data to explore the
+        dashboard without waiting on a full pipeline run.
+      </p>
 
-      <div className="card" style={{ marginBottom: '1.5rem' }}>
-        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-          <input type="file" accept="video/*" onChange={handleFileChange} disabled={loading} />
-          <button className="btn" onClick={handleUploadAndRun} disabled={loading}>
-            {loading ? 'Processing Pipeline...' : 'Run CV Pipeline'}
+      <div className="card">
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type="file"
+            accept="video/mp4,video/quicktime,video/x-msvideo"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            disabled={loading}
+          />
+          <button className="btn" onClick={startRealUpload} disabled={loading || !file}>
+            {loading ? 'Processing...' : 'Upload & Run Pipeline'}
+          </button>
+          <button
+            className="btn"
+            style={{ backgroundColor: 'var(--bg-hover)', color: 'var(--text-main)' }}
+            onClick={loadDemoData}
+            disabled={loading}
+          >
+            Load Demo Data
           </button>
         </div>
-      </div>
 
-      {error && <p className="status-error">Error: {error}</p>}
+        {error && <p className="status-error" style={{ marginTop: '1rem' }}>Error: {error}</p>}
 
-      {job && (
-        <div className="card">
-          <h4>Job Status: <span style={{ color: '#38bdf8' }}>{job.status.toUpperCase()}</span></h4>
-          <p>{job.message}</p>
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${job.progress}%` }}></div>
-          </div>
-          <small>Pipeline Progress: {job.progress}%</small>
-
-          {/* In-Browser Video Player -- served from the real backend's /storage mount */}
-          {job.video_id && (
-            <div style={{ marginTop: '1.5rem' }}>
-              <h4>Uploaded Match Video Player</h4>
-              <video
-                controls
-                width="100%"
-                style={{ maxHeight: '380px', borderRadius: '8px', border: '1px solid #334155' }}
-                src={`http://localhost:8000/storage/uploads/${job.video_id}.mp4`}
-              />
+        {job && (
+          <div style={{ marginTop: '1.5rem' }}>
+            <div className="metric-header">
+              <strong>Job ID:</strong> <code>{job.job_id ?? '(demo)'}</code>
+              <span className={`badge ${job.status === 'completed' ? 'badge-normal' : job.status === 'failed' ? 'badge-low_upstream_confidence' : 'badge-low_sample'}`}>
+                {job.status}
+              </span>
             </div>
-          )}
-        </div>
-      )}
 
-      {result && (
-        <div className="card">
-          <h3>Phase 2 Pipeline Deliverables</h3>
-          <p>
-            Frames Processed: <strong>{result.frames_processed}</strong> |{' '}
-            Unique Player Tracks: <strong>{result.total_tracks}</strong> |{' '}
-            Homography Confidence: <strong>{((result.homography_confidence || 0) * 100).toFixed(1)}%</strong>
-          </p>
+            <div className="progress-bar">
+              <div className="progress-fill" style={{ width: `${job.progress}%` }} />
+            </div>
 
-          <h4 style={{ marginTop: '1.5rem' }}>2D Pitch Spatial Heatmap Overlay (105m x 68m)</h4>
-          <canvas
-            ref={canvasRef}
-            width={640}
-            height={400}
-            style={{ border: '1px solid #334155', borderRadius: '8px', marginTop: '0.5rem' }}
-          />
-        </div>
-      )}
+            <div style={{ display: 'flex', justifyContent: 'space-between' }} className="metric-meta">
+              <span>{job.message}</span>
+              <span>{job.progress}%</span>
+            </div>
+
+            {job.status === 'failed' && job.error && (
+              <p className="status-error" style={{ marginTop: '0.5rem' }}>
+                {job.error}
+              </p>
+            )}
+
+            {job.status === 'completed' && job.match_id && (
+              <p className="metric-meta" style={{ marginTop: '0.75rem' }}>
+                Match <code>{job.match_id}</code> is ready — check the Player Intelligence and
+                Team Intelligence tabs.
+              </p>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

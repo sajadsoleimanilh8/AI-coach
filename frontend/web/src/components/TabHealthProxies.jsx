@@ -9,9 +9,6 @@ export default function TabHealthProxies() {
         <p className="metric-meta">
           Biomechanical fatigue tracking and ACWR (Acute:Chronic Workload Ratio) longitudinal models are slated for Phase 2 deployment.
         </p>
-        <div style={{ marginTop: '1rem', padding: '0.75rem', background: '#0f172a', borderRadius: '4px' }}>
-          <code>Mock Field: acwr_historical_status = "Pending longitudinal match accumulation"</code>
-        </div>
       </div>
     </div>
   );

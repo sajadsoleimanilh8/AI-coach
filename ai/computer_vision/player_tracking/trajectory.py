@@ -37,6 +37,29 @@ _AI_COMPUTER_VISION_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)
 if _AI_COMPUTER_VISION_DIR not in sys.path:
     sys.path.insert(0, _AI_COMPUTER_VISION_DIR)
 
+# FIXED (found while wiring pose estimation into backend/pipeline/runner.py
+# and actually running the import path it uses -- not caught before
+# because no test previously imported this module the way runner.py does).
+# The block above puts ai/computer_vision/ on sys.path so `tactical_analysis`
+# resolves, but `from tracker import TrackedDetection` below needs THIS
+# file's OWN directory (player_tracking/) on sys.path -- that's only true
+# by accident when a script imports this file directly from within
+# player_tracking/ (Python auto-adds a run script's own directory), which
+# is exactly what every existing test here does
+# (`sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))`
+# from inside player_tracking/tests/). It is NOT true when something
+# imports this module via its full package path, e.g.
+# `from ai.computer_vision.player_tracking.trajectory import ...`
+# -- which is exactly how backend/pipeline/runner.py imports it. That
+# import previously raised ModuleNotFoundError: No module named 'tracker'
+# the first time the real pipeline ran, since nothing had exercised this
+# import path before (there is still no backend/pipeline/tests/test_runner.py --
+# see that gap noted elsewhere). Adding this file's own directory fixes both
+# import styles at once.
+_PLAYER_TRACKING_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLAYER_TRACKING_DIR not in sys.path:
+    sys.path.insert(0, _PLAYER_TRACKING_DIR)
+
 # Import the tactical_analysis package built earlier.
 from tactical_analysis.constants import HOMOGRAPHY_CONFIDENCE_MIN
 from tactical_analysis.homography import pixel_to_pitch
@@ -60,6 +83,8 @@ class TrackingPoint:
     speed: float | None          # m/s
     distance: float | None       # meters, delta since previous point
     acceleration: float | None   # m/s^2
+    body_orientation_deg: float | None = None          # shoulder-line angle, 0-360; None if not sampled/not visible
+    body_orientation_confidence: float | None = None   # min shoulder-landmark visibility, 0-1
 
 
 def enrich_with_pitch_coordinates(
@@ -139,6 +164,45 @@ def enrich_with_pitch_coordinates(
                 last_speed_by_player[det.player_id] = speed
 
     return trajectories
+
+
+def attach_body_orientation(
+    trajectories: dict[int, list[TrackingPoint]],
+    orientation_by_player_frame: dict[tuple[int, int], "OrientationResult"],
+) -> None:
+    """
+    Mutates `trajectories` in place, filling in body_orientation_deg/
+    body_orientation_confidence on the TrackingPoints that have a pose
+    reading.
+
+    Kept as a separate pass rather than computed inline inside
+    enrich_with_pitch_coordinates() on purpose: pose estimation
+    (ai/computer_vision/pose_estimation/pose.py) is expensive enough that
+    it's only run on a stride-sampled subset of frames (see
+    POSE_SAMPLE_STRIDE in backend/pipeline/runner.py), not every frame
+    like the pixel->pitch homography above -- mixing a sparse data source
+    into the main per-frame loop would make that loop's "is this frame
+    usable" logic harder to reason about for no benefit, since orientation
+    readings are sparse by design, not by failure.
+
+    Args:
+        trajectories: output of enrich_with_pitch_coordinates(), mutated
+            in place.
+        orientation_by_player_frame: {(player_id, frame_number): OrientationResult}
+            for whichever (player, frame) pairs were actually sampled --
+            most (player_id, frame_number) combinations in a trajectory
+            will simply have no entry here, and those TrackingPoints keep
+            their default None/None (dataclass defaults above), which is
+            the correct "not measured" state, not an error.
+    """
+    for player_id, points in trajectories.items():
+        for point in points:
+            key = (player_id, point.frame_id)
+            reading = orientation_by_player_frame.get(key)
+            if reading is None:
+                continue
+            point.body_orientation_deg = reading.orientation_deg
+            point.body_orientation_confidence = reading.confidence
 
 
 def total_distance_covered(trajectory: list[TrackingPoint]) -> float:

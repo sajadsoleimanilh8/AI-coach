@@ -25,6 +25,36 @@ IDEAL_DEFENSIVE_SPACING_M = 10.0  # Ideal distance between adjacent defenders
 SPACING_TOLERANCE_M = 3.0  # Spacing Gaussian tolerance
 REACTION_SPEED_REFERENCE_MS = 3.0  # Closing speed reference for threat reaction
 
+# Day 7 (pose / body orientation) new constants.
+# NOTE on calibration status: these two are uncalibrated starting points,
+# same caveat as Formation Detection's NORMALIZATION_CONSTANT (see
+# docs/data analysis.md §3's calibration procedure) -- not yet tuned
+# against real match clips with known-correct scan counts. Do not present
+# scanning_behavior_score's absolute value to judges as validated; the
+# relative ranking (more scans = higher score) is sound, the specific
+# scale is not yet.
+SCAN_ANGLE_THRESHOLD_DEG = 30.0  # min shoulder-angle change between consecutive
+                                  # pose readings to count as one "scan" (head/shoulder check)
+SCAN_MAX_GAP_S = 2.0  # ignore orientation deltas spanning more than this many
+                       # seconds between readings -- likely a play stoppage or a
+                       # tracking gap, not one continuous scanning motion
+SCANS_PER_MINUTE_TARGET = 8.0  # scans/min mapped to a 100 score; placeholder,
+                                # needs the same real-clip calibration procedure
+                                # as NORMALIZATION_CONSTANT before judges see it
+                                # presented as anything but a relative ranking
+
+# Body Orientation Score: "squareness" (0deg = shoulders parallel to the
+# pitch's long axis, i.e. facing straight down the pitch; 90deg = fully
+# side-on) mapped to a Gaussian centered on IDEAL_SQUARENESS_DEG. This
+# encodes the common coaching cue that a "half-turned"/open stance
+# (angled diagonally, not square-on or fully side-on) maximizes a
+# player's visual field of both the ball and forward options. Same
+# calibration caveat as SCANS_PER_MINUTE_TARGET above -- this is a
+# defensible starting point grounded in a real coaching heuristic, not a
+# number fit to labeled data, and should be described to judges that way.
+IDEAL_SQUARENESS_DEG = 45.0
+SQUARENESS_TOLERANCE_DEG = 25.0
+
 # Pitch Dimensions (Standard FIFA Pitch in meters)
 PITCH_LENGTH_M = 105.0
 PITCH_WIDTH_M = 68.0

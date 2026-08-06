@@ -36,11 +36,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+
+# FIXED: same bug class as ai/computer_vision/player_tracking/trajectory.py's
+# `from tracker import TrackedDetection` (see that file's fix comment for the
+# full explanation). `from constants import ...` / `from homography import
+# ...` below only resolve when this file's OWN directory
+# (ai/computer_vision/tactical_analysis/) happens to be on sys.path -- true
+# when a script is run directly from within this directory, NOT true when
+# something imports this module via its full package path, e.g.
+# `from ai.computer_vision.tactical_analysis.manual_calibration import
+# load_calibration` -- which is exactly how backend/pipeline/runner.py
+# imports it. That raised `ModuleNotFoundError: No module named 'constants'`
+# the first time a real pipeline run actually reached calibration loading.
+_TACTICAL_ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TACTICAL_ANALYSIS_DIR not in sys.path:
+    sys.path.insert(0, _TACTICAL_ANALYSIS_DIR)
 
 from constants import CALIBRATION_POINT_ORDER, MIN_CALIBRATION_POINTS, REFERENCE_POINTS
 from homography import compute_homography

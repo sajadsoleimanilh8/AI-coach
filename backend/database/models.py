@@ -128,7 +128,22 @@ class PlayerTracking(Base):
     tracking_id = Column(String(36), primary_key=True, default=new_id)
     match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False, index=True)
     player_id = Column(Integer, nullable=False)
-    frame_id = Column(Integer, ForeignKey("frames.frame_id"), nullable=False, index=True)
+
+    # FIXED (found via a real pipeline run on ~35k tracking rows): this was
+    # declared as ForeignKey("frames.frame_id") with nullable=False, but
+    # `frames` rows are only persisted for a FRAME_PERSIST_STRIDE-sampled
+    # subset (see backend/pipeline/runner.py), with an autoincrement PK
+    # unrelated to the actual video frame number -- while every
+    # TrackingPoint naturally carries the real frame *number* (0, 1, 2, ...),
+    # not a Frame.frame_id row reference. These two ID spaces don't
+    # correspond, so this could never be populated as a real FK. The
+    # previous code's workaround (writing None here) hit the nullable=False
+    # constraint the first time bulk_save_objects() ran on real data,
+    # crashing the pipeline outright. Nothing elsewhere in the codebase
+    # joins on this column as a real FK (checked), so dropping the FK
+    # constraint and storing the real frame number is the correct fix --
+    # not a fake reference to a table row that doesn't exist for most frames.
+    frame_id = Column(Integer, nullable=False, index=True)  # actual video frame number, NOT a frames.frame_id FK
     team_id = Column(String(64), nullable=True)
     pixel_x = Column(Float, nullable=False)
     pixel_y = Column(Float, nullable=False)
@@ -138,6 +153,19 @@ class PlayerTracking(Base):
     speed = Column(Float, nullable=True)
     distance = Column(Float, nullable=True)
     acceleration = Column(Float, nullable=True)
+
+    # Added for Phase 2 Day 7 (pose / body orientation). Nullable for the
+    # same reason pitch_x_m/homography_confidence are nullable: a frame
+    # can legitimately have no reading (pose not sampled this frame --
+    # see POSE_SAMPLE_STRIDE in backend/pipeline/runner.py -- or MediaPipe
+    # found no visible shoulder landmarks). None means "not measured",
+    # never silently defaulted to 0.0 -- a 0deg orientation is a real,
+    # different fact from "we don't know". Downstream consumers must
+    # check body_orientation_confidence before trusting the angle, same
+    # pattern as homography_confidence gating pitch_x_m/pitch_y_m.
+    body_orientation_deg = Column(Float, nullable=True)         # shoulder-line angle, 0-360
+    body_orientation_confidence = Column(Float, nullable=True)  # min visibility of the two shoulder landmarks, 0-1
+
     match = relationship("Match", back_populates="player_trackings")
 
 class Event(Base):

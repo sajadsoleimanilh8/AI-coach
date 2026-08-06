@@ -199,7 +199,21 @@ def track_detections(
         list of list[TrackedDetection], same length and frame order as
         `frames`.
     """
+    import os
+    import sys
+
     import numpy as np
+
+    # FIXED (same bug class found in trajectory.py and manual_calibration.py
+    # -- see their fix comments): this bare `from bytetrack import ...` only
+    # resolves when player_tracking/ is already on sys.path. Currently dormant
+    # in production (run_pipeline() only calls track_video(), never
+    # track_detections()), but fixing it here too so this doesn't become the
+    # next silent landmine if something starts calling this function via its
+    # full package path.
+    _PLAYER_TRACKING_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _PLAYER_TRACKING_DIR not in sys.path:
+        sys.path.insert(0, _PLAYER_TRACKING_DIR)
 
     from bytetrack import BYTETracker, STrack
 

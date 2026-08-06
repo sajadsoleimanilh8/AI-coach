@@ -50,10 +50,13 @@ from ai.computer_vision.tactical_analysis.constants import (
 )
 from ai.computer_vision.tactical_analysis.formation_detection import detect_formation
 from ai.computer_vision.tactical_analysis.possession import detect_first_touches, get_ball_possessor
+from ai.computer_vision.player_tracking.trajectory import attach_body_orientation
+from ai.player_intelligence.body_orientation_score.score import score_body_orientation
 from ai.player_intelligence.defensive_positioning.score import score_defensive_positioning
 from ai.player_intelligence.first_touch_score.score import score_first_touch
 from ai.player_intelligence.off_ball_movement.score import score_off_ball_movement
 from ai.player_intelligence.press_resistance_score.score import score_press_resistance
+from ai.player_intelligence.scanning_behavior.score import score_scanning_behavior
 from ai.team_intelligence.formation_stability.team_shape import compute_compactness, compute_formation_stability
 from ai.team_intelligence.pressing_structure_analysis.pressing import compute_pressing_intensity
 from ai.team_intelligence.weak_zone_detection.weak_zones import compute_weak_zones
@@ -82,6 +85,13 @@ TEAM_ASSIGNMENT_CONFIDENCE = 0.0
 # only thins out the raw-detection audit trail, which is far higher volume
 # and mostly useful for debugging/replay, not scoring itself.
 FRAME_PERSIST_STRIDE = int(os.getenv("FRAME_PERSIST_STRIDE", "5"))
+
+# Pose estimation (Day 7) is run on a stride-sampled subset of frames per
+# player, not every frame -- MediaPipe per-crop is far more expensive than
+# the homography math it feeds alongside, and orientation is a slowly-
+# changing signal relative to position/speed, so sparse sampling loses
+# little. See ai/computer_vision/pose_estimation/pose.py's docstring.
+POSE_SAMPLE_STRIDE = int(os.getenv("POSE_SAMPLE_STRIDE", "10"))
 
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH")
 CALIBRATION_DIR = os.getenv("CALIBRATION_DIR", "calibrations")
@@ -165,21 +175,29 @@ def run_pipeline(db: Session, job: ProcessingJob, timer: PipelineTimer, progress
             frames, match.match_id, H, homography_confidence, fps
         )
 
-    # ---- Stage 4: persist raw detections + tracking (sampled) ---------
+    # ---- Stage 4: pose / body orientation (Day 7) ----------------------
+    report(50, "Estimating body orientation (pose)...")
+    with timer.stage("pose_estimation"):
+        orientation_by_player_frame = _estimate_orientations(
+            video.storage_path, frames, stride=POSE_SAMPLE_STRIDE
+        )
+        attach_body_orientation(trajectories, orientation_by_player_frame)
+
+    # ---- Stage 5: persist raw detections + tracking (sampled) ---------
     report(55, "Writing detection & tracking rows...")
     with timer.stage("db_write_tracking"):
         n_frames_persisted = _persist_frames_and_tracking(
             db, match, frames, trajectories, fps
         )
 
-    # ---- Stage 5: event heuristics (pass/shot/turnover/first-touch) ---
+    # ---- Stage 6: event heuristics (pass/shot/turnover/first-touch) ---
     report(65, "Extracting pass, shot, turnover, and first-touch events...")
     with timer.stage("event_heuristics"):
         events = _detect_events(match, trajectories, ball_trajectory, fps)
         db.bulk_save_objects(events)
         db.commit()
 
-    # ---- Stage 6: formation + team shape -------------------------------
+    # ---- Stage 7: formation + team shape -------------------------------
     report(78, "Calculating formation and team shape metrics...")
     with timer.stage("team_scoring"):
         team_metrics = _score_team_intelligence(match, trajectories)
@@ -187,10 +205,10 @@ def run_pipeline(db: Session, job: ProcessingJob, timer: PipelineTimer, progress
             db.add(_team_metric_from_dict(match.match_id, tm_dict))
         db.commit()
 
-    # ---- Stage 7: per-player scores ------------------------------------
+    # ---- Stage 8: per-player scores ------------------------------------
     report(90, "Calculating per-player intelligence scores...")
     with timer.stage("player_scoring"):
-        player_metrics = _score_player_intelligence(match, trajectories, events, homography_confidence)
+        player_metrics = _score_player_intelligence(match, trajectories, events, homography_confidence, fps)
         for pm_dict, player_id in player_metrics:
             db.add(_player_metric_from_dict(match.match_id, player_id, pm_dict))
         db.commit()
@@ -292,6 +310,89 @@ def _build_trajectories(frames, match_id: str, H, homography_confidence: float, 
     return trajectories, ball_trajectory
 
 
+def _estimate_orientations(video_path: str, frames, stride: int) -> dict:
+    """
+    Runs pose estimation on a stride-sampled subset of (player, frame)
+    pairs and returns {(player_id, frame_number): OrientationResult}.
+
+    Deliberately tolerant of pose_estimation failures on individual
+    frames/players: a crop that's too small, a corrupt read, or a
+    mediapipe error on one (player, frame) pair should not fail the whole
+    pipeline run the way a missing YOLO_MODEL_PATH does (see
+    PipelineAssetError) -- pose is an enrichment on top of tracking that
+    already succeeded, not a required asset. Frames/players that fail
+    simply have no entry in the returned dict, which
+    attach_body_orientation() already treats as "not measured" (see its
+    docstring) -- the honest default, not a crash.
+
+    If mediapipe's legacy Solutions API isn't available at all on this
+    machine (see pose.py's _load_legacy_pose_solution() docstring for the
+    known-gotcha explanation), this degrades to returning an empty dict --
+    every PlayerTracking row's body_orientation_deg stays None, and
+    body_orientation_score/scanning_behavior_score correctly report
+    low_sample rather than the run failing outright. A missing optional
+    enrichment should not block the CV/tracking/scoring core that Day
+    4-6 already delivers.
+    """
+    if stride <= 0 or not os.path.exists(video_path):
+        return {}
+
+    try:
+        from ai.computer_vision.pose_estimation.pose import estimate_body_orientation
+    except ImportError:
+        return {}
+
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {}
+
+    orientation_by_player_frame: dict[tuple[int, int], object] = {}
+    try:
+        for frame_number, detections in enumerate(frames):
+            # cap.read() always advances to the NEXT sequential frame --
+            # it cannot be skipped forward without reading (or an
+            # imprecise CAP_PROP_POS_FRAMES seek, which is unreliable on
+            # many codecs). Read every frame to stay in sync with
+            # `frame_number`, but only spend time on the expensive
+            # crop+MediaPipe work when this frame is actually sampled.
+            ok, raw_frame = cap.read()
+            if not ok or raw_frame is None:
+                break  # end of video, or a decode failure we can't recover from
+
+            if frame_number % stride != 0:
+                continue
+
+            player_dets = [d for d in detections if d.class_name in ("player", "goalkeeper")]
+            if not player_dets:
+                continue
+
+            frame_h, frame_w = raw_frame.shape[:2]
+            for det in player_dets:
+                x1 = max(0, int(det.x))
+                y1 = max(0, int(det.y))
+                x2 = min(frame_w, int(det.x + det.width))
+                y2 = min(frame_h, int(det.y + det.height))
+                if x2 <= x1 or y2 <= y1:
+                    continue  # degenerate bbox -- estimate_body_orientation()
+                                # handles this too, but skip the crop entirely here
+
+                crop = raw_frame[y1:y2, x1:x2]
+                try:
+                    reading = estimate_body_orientation(crop)
+                except Exception:
+                    # One bad crop/model call must not take down the whole
+                    # stage -- see this function's docstring.
+                    continue
+
+                orientation_by_player_frame[(det.player_id, frame_number)] = reading
+    finally:
+        cap.release()
+
+    return orientation_by_player_frame
+
+
 def _persist_frames_and_tracking(db: Session, match: Match, frames, trajectories, fps: float) -> int:
     frame_rows = []
     detection_rows = []
@@ -337,12 +438,14 @@ def _persist_frames_and_tracking(db: Session, match: Match, frames, trajectories
             tracking_rows.append(PlayerTracking(
                 match_id=match.match_id,
                 player_id=p.player_id,
-                frame_id=None,  # sampled Frame rows don't cover every point; tracking is match-scoped, not frame-FK'd here
+                frame_id=p.frame_id,  # FIXED: real video frame number (see models.py's PlayerTracking.frame_id comment for why this must not be None/an FK)
                 team_id=p.team_id,
                 pixel_x=p.pixel_x, pixel_y=p.pixel_y,
                 pitch_x_m=p.pitch_x_m, pitch_y_m=p.pitch_y_m,
                 homography_confidence=p.homography_confidence,
                 speed=p.speed, distance=p.distance, acceleration=p.acceleration,
+                body_orientation_deg=p.body_orientation_deg,
+                body_orientation_confidence=p.body_orientation_confidence,
             ))
     db.bulk_save_objects(tracking_rows)
     db.commit()
@@ -352,15 +455,7 @@ def _persist_frames_and_tracking(db: Session, match: Match, frames, trajectories
 def _detect_events(match: Match, trajectories: dict, ball_trajectory: list[dict], fps: float) -> list[Event]:
     # Build a chronological possession sequence: for each frame with a
     # usable ball position, find its possessor among tracked players.
-    players_by_frame: dict[int, list[dict]] = {}
-    for player_id, points in trajectories.items():
-        for idx, p in enumerate(points):
-            players_by_frame.setdefault(idx, []).append({
-                "player_id": p.player_id,
-                "team_id": p.team_id,
-                "pitch_x_m": p.pitch_x_m,
-                "pitch_y_m": p.pitch_y_m,
-            })
+    players_by_frame = _build_players_by_frame(trajectories)
 
     possession_sequence: list[dict] = []
     for ball_pt in ball_trajectory:
@@ -516,7 +611,118 @@ def _positions_by_frame(trajectories: dict) -> list[list[tuple]]:
     return frames_positions
 
 
-def _score_player_intelligence(match: Match, trajectories: dict, events: list[Event], homography_confidence: float):
+def _build_players_by_frame(trajectories: dict) -> dict[int, list[dict]]:
+    """
+    {enumerate-index-within-each-player's-own-point-list: [{player_id,
+    team_id, pitch_x_m, pitch_y_m}, ...]}.
+
+    Shared by _detect_events() and _score_player_intelligence() (was
+    previously duplicated inline in _detect_events only). NOTE -- known
+    limitation carried over unchanged from the original code: this keys
+    by each player's own point-list index, not by the point's actual
+    frame_id. That's exact as long as every tracked player has one
+    TrackingPoint per frame with no gaps; if ByteTrack loses a player for
+    several frames (occlusion) and re-acquires them, their point-list
+    index drifts out of alignment with frame_id from that point on, and
+    "same index" across two players' point lists is no longer guaranteed
+    to mean "same actual frame." Not fixed here -- fixing it properly
+    means re-keying this whole structure by real frame_id everywhere it's
+    consumed, which is a bigger change than this pass's scope. Flagging
+    it explicitly rather than silently building on top of it.
+    """
+    players_by_frame: dict[int, list[dict]] = {}
+    for player_id, points in trajectories.items():
+        for idx, p in enumerate(points):
+            players_by_frame.setdefault(idx, []).append({
+                "player_id": p.player_id,
+                "team_id": p.team_id,
+                "pitch_x_m": p.pitch_x_m,
+                "pitch_y_m": p.pitch_y_m,
+            })
+    return players_by_frame
+
+
+def _nearest_other_player_distance(player_id: int, x: float, y: float, frame_others: list[dict]) -> float | None:
+    """Distance to the closest OTHER tracked player at this frame. Same
+    documented nearest-other-player-as-opponent-stand-in approximation as
+    _enrich_first_touch_metadata() uses, for the same reason
+    (TEAM_ASSIGNMENT_CONFIDENCE == 0.0 -- see module docstring)."""
+    others = [p for p in frame_others if p["player_id"] != player_id and p["pitch_x_m"] is not None]
+    if not others:
+        return None
+    return min(((p["pitch_x_m"] - x) ** 2 + (p["pitch_y_m"] - y) ** 2) ** 0.5 for p in others)
+
+
+def _compute_off_ball_inputs(player_id: int, points: list, players_by_frame: dict[int, list[dict]]) -> dict:
+    """
+    Derives score_off_ball_movement()'s inputs from real trajectory data
+    instead of the all-zero defaults it was previously called with (see
+    the FIXED note in _score_player_intelligence below).
+
+    Honesty notes on what IS and ISN'T computed here:
+      - total_path_length_m / net_displacement_m: real, computed directly
+        from this player's own trajectory -- no team info needed.
+      - avg_distance_gained_from_marker: real, but built on the same
+        nearest-other-player stand-in for "opponent" as first-touch
+        pressure (see _nearest_other_player_distance's docstring) --
+        averages the positive frame-to-frame change in that distance
+        (separation gained), zero contribution on frames where the
+        player closed distance instead of gaining it.
+      - off_ball_frames_in_attacking_third / total_off_ball_frames_while_
+        team_in_possession: deliberately left at 0/0. Genuinely computing
+        this needs (a) team assignment, to know which players share this
+        player's team and which goal that team is attacking, and (b)
+        possession windows scoped to that team -- neither exists yet
+        (TEAM_ASSIGNMENT_CONFIDENCE == 0.0). Passing 0/0 makes
+        score_off_ball_movement()'s safe_ratio(..., default=None) return
+        None for this sub-score honestly, rather than guessing a
+        plausible-looking count.
+      - sample_size_phases: count of valid consecutive-frame pairs used
+        for the space-creation computation above. A real, grounded
+        number tied to actual measured data -- but an approximation of
+        "off-ball phases" in the sports-science sense (a phase would
+        normally be one continuous off-the-ball stretch during a
+        team-possession window); described as such rather than presented
+        as a validated phase count.
+    """
+    valid_points = [p for p in points if p.pitch_x_m is not None]
+
+    total_path_length_m = 0.0
+    for prev, nxt in zip(valid_points, valid_points[1:]):
+        total_path_length_m += ((nxt.pitch_x_m - prev.pitch_x_m) ** 2 + (nxt.pitch_y_m - prev.pitch_y_m) ** 2) ** 0.5
+
+    net_displacement_m = 0.0
+    if len(valid_points) >= 2:
+        first, last = valid_points[0], valid_points[-1]
+        net_displacement_m = ((last.pitch_x_m - first.pitch_x_m) ** 2 + (last.pitch_y_m - first.pitch_y_m) ** 2) ** 0.5
+
+    separation_gains: list[float] = []
+    for idx in range(len(points) - 1):
+        p_now, p_next = points[idx], points[idx + 1]
+        if p_now.pitch_x_m is None or p_next.pitch_x_m is None:
+            continue
+        dist_now = _nearest_other_player_distance(player_id, p_now.pitch_x_m, p_now.pitch_y_m, players_by_frame.get(idx, []))
+        dist_next = _nearest_other_player_distance(player_id, p_next.pitch_x_m, p_next.pitch_y_m, players_by_frame.get(idx + 1, []))
+        if dist_now is None or dist_next is None:
+            continue
+        gain = dist_next - dist_now
+        separation_gains.append(max(gain, 0.0))
+
+    avg_distance_gained_from_marker = sum(separation_gains) / len(separation_gains) if separation_gains else 0.0
+
+    return {
+        "avg_distance_gained_from_marker": avg_distance_gained_from_marker,
+        "off_ball_frames_in_attacking_third": 0,
+        "total_off_ball_frames_while_team_in_possession": 0,
+        "net_displacement_m": net_displacement_m,
+        "total_path_length_m": total_path_length_m,
+        "sample_size_phases": len(separation_gains),
+    }
+
+
+def _score_player_intelligence(
+    match: Match, trajectories: dict, events: list[Event], homography_confidence: float, fps: float
+):
     results = []
     events_by_player: dict[int, list[dict]] = {}
     for e in events:
@@ -525,6 +731,8 @@ def _score_player_intelligence(match: Match, trajectories: dict, events: list[Ev
                 "homography_confidence": e.homography_confidence,
                 "metadata_json": e.metadata_json,
             })
+
+    players_by_frame = _build_players_by_frame(trajectories)
 
     for player_id, points in trajectories.items():
         player_events = events_by_player.get(player_id, [])
@@ -545,8 +753,35 @@ def _score_player_intelligence(match: Match, trajectories: dict, events: list[Ev
         defensive_positioning = score_defensive_positioning(team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
         results.append((defensive_positioning, player_id))
 
-        off_ball = score_off_ball_movement(homography_confidence=homography_confidence)
+        # FIXED (this pass): score_off_ball_movement() was previously
+        # called with homography_confidence as its ONLY argument -- every
+        # other input silently defaulted to 0.0/0, so this metric always
+        # returned confidence="low_sample" (correctly, thanks to the
+        # sample_size_phases < MIN_SAMPLE_EVENTS gate already in
+        # score.py) but never actually measured anything, on every
+        # player, every match. See _compute_off_ball_inputs() above for
+        # what's now real vs. still honestly unmeasured.
+        off_ball_inputs = _compute_off_ball_inputs(player_id, points, players_by_frame)
+        off_ball = score_off_ball_movement(homography_confidence=homography_confidence, **off_ball_inputs)
         results.append((off_ball, player_id))
+
+        # Body orientation / scanning behavior (Day 7). Both are sparse --
+        # only the stride-sampled frames have a real reading (see
+        # POSE_SAMPLE_STRIDE / _estimate_orientations) -- so most matches/
+        # players will land on "low_sample" until enough readings
+        # accumulate, same honest pattern as everything else here.
+        orientation_values = [p.body_orientation_deg for p in points if p.body_orientation_deg is not None]
+        body_orientation = score_body_orientation(orientation_values)
+        results.append((body_orientation, player_id))
+
+        orientation_readings = [
+            (p.frame_id / fps, p.body_orientation_deg)
+            for p in points
+            if p.body_orientation_deg is not None
+        ]
+        tracked_duration_s = (points[-1].frame_id - points[0].frame_id) / fps if len(points) >= 2 else 0.0
+        scanning = score_scanning_behavior(orientation_readings, tracked_duration_s=tracked_duration_s)
+        results.append((scanning, player_id))
 
     return results
 

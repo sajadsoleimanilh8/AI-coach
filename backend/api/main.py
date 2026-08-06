@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from backend.api import player_intelligence, tactical
@@ -33,6 +34,34 @@ app = FastAPI(
     title="SportsStrategyCoachAI Backend",
     version="0.1.0",
     description="Video upload, processing status, and analysis JSON API.",
+)
+
+# FIXED: no CORSMiddleware was registered anywhere in this app, despite
+# the frontend (frontend/web/src/api/client.js) calling it directly with
+# fetch() from the Vite dev server's own origin (localhost:3000) to this
+# backend's origin (localhost:8000) -- two different ports are two
+# different origins under the same-origin policy, so every browser
+# request here is cross-origin. Without this, the browser blocks the
+# response (or the CORS preflight OPTIONS request itself gets rejected)
+# before any application code ever runs -- this is a browser-side block,
+# not something backend logging/error handling can catch, which is why
+# nothing in this file's own code was returning an error.
+#
+# allow_origins is explicit (not "*") because allow_credentials=True is
+# on below (kept in case cookie/session auth gets added later) --
+# wildcard origins + credentials is rejected by browsers anyway, and
+# being explicit here means this list is the one place to update if a
+# deployed frontend origin is added later instead of silently opening it
+# to every origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Register Phase 3 routers

@@ -3,11 +3,24 @@ import { api } from '../api/client';
 import { mockApi } from '../api/mockClient';
 import MetricBadge from './MetricBadge';
 
+// FIXED: this used to hardcode only 4 of the 9 scores the pipeline
+// actually computes (missing body_orientation_score/scanning_behavior_score,
+// plus the 3 scores added alongside jersey-color team assignment --
+// passing_vision_score/decision_making_score/finishing_efficiency_score).
+// Metrics not listed here were never dropped from the API response, just
+// silently absent from the radar -- the metrics-grid below already shows
+// every metric regardless of this list. All 9 now render as radar axes
+// too, so the chart reflects the same set of scores the grid does.
 const RADAR_KEYS = [
   { key: 'first_touch_score', label: 'First Touch' },
   { key: 'press_resistance_score', label: 'Press Resistance' },
   { key: 'off_ball_movement_score', label: 'Off-Ball Movement' },
   { key: 'defensive_positioning_score', label: 'Defensive Position' },
+  { key: 'body_orientation_score', label: 'Body Orientation' },
+  { key: 'scanning_behavior_score', label: 'Scanning Behavior' },
+  { key: 'passing_vision_score', label: 'Passing Vision' },
+  { key: 'decision_making_score', label: 'Decision Making' },
+  { key: 'finishing_efficiency_score', label: 'Finishing Efficiency' },
 ];
 
 function PlayerRadarChart({ metrics, playerName }) {

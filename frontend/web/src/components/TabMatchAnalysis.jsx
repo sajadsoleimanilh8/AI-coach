@@ -32,12 +32,13 @@ const TRACKING_WINDOW = 150;
 // dropping it once the last reading is stale enough to be misleading.
 const BALL_STALE_FRAMES = 8;
 
-// Real team_id values ("team-home"/"team-away") aren't produced yet --
-// jersey-color clustering isn't implemented (see backend/pipeline/runner.py's
-// TEAM_ASSIGNMENT_CONFIDENCE = 0.0), so every tracked player currently has
-// team_id=null and renders gray below. These two entries exist so that once
-// team assignment ships, real values get real (not invented) colors instead
-// of falling through to the "unknown team_id we've never seen" fallback.
+// Real team_id values ("team-home"/"team-away") now come from jersey-color
+// clustering (see ai/computer_vision/tactical_analysis/team_assignment.py,
+// wired into backend/pipeline/runner.py's Stage 1.5). A tracked player can
+// still render gray -- that's not a missing feature, it means THIS track's
+// own team_assignment_confidence fell below TEAM_ASSIGNMENT_CONFIDENCE_MIN
+// (e.g. too few usable jersey-color crops sampled for that track), so its
+// team_id was honestly left null rather than forced to a guess.
 const TEAM_COLORS = { 'team-home': '#3b82f6', 'team-away': '#ef4444' };
 const UNASSIGNED_COLOR = '#9ca3af';
 const OTHER_TEAM_COLOR = '#a855f7';
@@ -334,7 +335,7 @@ function TrackingOverlayPlayer({ matchId, videoId }) {
             />
           </div>
           <div className="metric-meta" style={{ marginTop: '0.5rem', textAlign: 'center' }}>
-            <span style={{ color: UNASSIGNED_COLOR }}>&#9679;</span> unassigned player (team assignment not implemented yet)
+            <span style={{ color: UNASSIGNED_COLOR }}>&#9679;</span> unassigned player (below team-assignment confidence threshold)
             {' '}&nbsp;<span style={{ color: BALL_COLOR }}>&#9679;</span> ball
           </div>
         </>

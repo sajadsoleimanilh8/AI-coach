@@ -21,16 +21,20 @@ Honesty rules this module follows (do not weaken these when extending it):
     is passed through honestly from what was actually measured this run --
     never hardcoded to a "safe" value to make a module compute instead of
     reporting low_upstream_confidence.
-  - team_assignment_confidence is currently always 0.0: jersey-color
-    clustering (see recent_updates) isn't implemented yet. This is
-    intentional, not a bug -- Formation/Press Resistance/Defensive
-    Positioning/team-shape splits will correctly report
-    "low_upstream_confidence" until that ships. Do not fake a team split
-    to make those modules produce numbers.
+  - team_assignment_confidence is now a REAL, per-run measurement -- see
+    Stage 1.5 (_assign_teams_stage / ai/computer_vision/tactical_analysis/
+    team_assignment.py's assign_teams()), which clusters players into two
+    teams by jersey color and returns a match-level cluster-separation
+    confidence. Formation/Press Resistance/Defensive Positioning/team-shape
+    splits still correctly report "low_upstream_confidence" whenever that
+    measured value is genuinely low (short clip, similar-colored kits,
+    heavy occlusion) -- the gate itself is unchanged, only the value
+    feeding it is no longer hardcoded.
 """
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +46,7 @@ from ai.computer_vision.shot_detection.shot_heuristics import detect_shots
 from ai.computer_vision.tactical_analysis.constants import (
     HOMOGRAPHY_CONFIDENCE_MIN,
     MIN_SAMPLE_EVENTS,
+    PASS_DIRECTION_SECTORS,
     PITCH_LENGTH_M,
     PITCH_WIDTH_M,
     RETENTION_WINDOW_S,
@@ -50,11 +55,15 @@ from ai.computer_vision.tactical_analysis.constants import (
 )
 from ai.computer_vision.tactical_analysis.formation_detection import detect_formation
 from ai.computer_vision.tactical_analysis.possession import detect_first_touches, get_ball_possessor
+from ai.computer_vision.tactical_analysis.team_assignment import assign_teams
 from ai.computer_vision.player_tracking.trajectory import attach_body_orientation
 from ai.player_intelligence.body_orientation_score.score import score_body_orientation
+from ai.player_intelligence.decision_making_score.score import score_decision_making
 from ai.player_intelligence.defensive_positioning.score import score_defensive_positioning
+from ai.player_intelligence.finishing_efficiency_score.score import score_finishing_efficiency
 from ai.player_intelligence.first_touch_score.score import score_first_touch
 from ai.player_intelligence.off_ball_movement.score import score_off_ball_movement
+from ai.player_intelligence.passing_vision_score.score import score_passing_vision
 from ai.player_intelligence.press_resistance_score.score import score_press_resistance
 from ai.player_intelligence.scanning_behavior.score import score_scanning_behavior
 from ai.team_intelligence.formation_stability.team_shape import compute_compactness, compute_formation_stability
@@ -73,12 +82,6 @@ from backend.database.models import (
     TeamMetric,
 )
 from backend.pipeline.latency import PipelineTimer
-
-# Team assignment (jersey-color clustering) is not implemented yet -- see
-# the module docstring. This constant is the single place that fact is
-# encoded, so it's impossible for one module to "forget" and silently
-# assume team splits are trustworthy.
-TEAM_ASSIGNMENT_CONFIDENCE = 0.0
 
 # Every Nth frame gets a persisted Frame/PlayerDetection/BallDetection row.
 # PlayerTracking (used for scoring) is still built from every frame -- this
@@ -162,6 +165,16 @@ def run_pipeline(db: Session, job: ProcessingJob, timer: PipelineTimer, progress
     with timer.stage("detection_tracking", detail=f"model={YOLO_MODEL_PATH}"):
         frames = _run_detection_and_tracking(video.storage_path)
 
+    # ---- Stage 1.5: jersey-color team assignment ------------------------
+    # Must run before Stage 3 (_build_trajectories): enrich_with_pitch_coordinates()
+    # copies det.team_id onto TrackingPoint verbatim, so team_id needs to
+    # already be final by then. Mutates `frames` in place -- see
+    # assign_teams()'s own docstring for the full algorithm and honesty
+    # rules (per-track majority vote, goalkeepers always left unassigned).
+    report(20, "Assigning players to teams via jersey-color clustering...")
+    with timer.stage("team_assignment"):
+        team_assignment_confidence = assign_teams(video.storage_path, frames)
+
     # ---- Stage 2: homography calibration ------------------------------
     report(30, "Loading pitch calibration...")
     with timer.stage("homography_calibration"):
@@ -193,14 +206,14 @@ def run_pipeline(db: Session, job: ProcessingJob, timer: PipelineTimer, progress
     # ---- Stage 6: event heuristics (pass/shot/turnover/first-touch) ---
     report(65, "Extracting pass, shot, turnover, and first-touch events...")
     with timer.stage("event_heuristics"):
-        events = _detect_events(match, trajectories, ball_trajectory, fps)
+        events, possession_segments = _detect_events(match, trajectories, ball_trajectory, fps)
         db.bulk_save_objects(events)
         db.commit()
 
     # ---- Stage 7: formation + team shape -------------------------------
     report(78, "Calculating formation and team shape metrics...")
     with timer.stage("team_scoring"):
-        team_metrics = _score_team_intelligence(match, trajectories)
+        team_metrics = _score_team_intelligence(match, trajectories, team_assignment_confidence)
         for tm_dict in team_metrics:
             db.add(_team_metric_from_dict(match.match_id, tm_dict))
         db.commit()
@@ -208,7 +221,10 @@ def run_pipeline(db: Session, job: ProcessingJob, timer: PipelineTimer, progress
     # ---- Stage 8: per-player scores ------------------------------------
     report(90, "Calculating per-player intelligence scores...")
     with timer.stage("player_scoring"):
-        player_metrics = _score_player_intelligence(match, trajectories, events, homography_confidence, fps)
+        player_metrics = _score_player_intelligence(
+            match, trajectories, events, homography_confidence, fps,
+            team_assignment_confidence, possession_segments,
+        )
         for pm_dict, player_id in player_metrics:
             db.add(_player_metric_from_dict(match.match_id, player_id, pm_dict))
         db.commit()
@@ -452,7 +468,9 @@ def _persist_frames_and_tracking(db: Session, match: Match, frames, trajectories
     return n_persisted
 
 
-def _detect_events(match: Match, trajectories: dict, ball_trajectory: list[dict], fps: float) -> list[Event]:
+def _detect_events(
+    match: Match, trajectories: dict, ball_trajectory: list[dict], fps: float
+) -> tuple[list[Event], list[dict]]:
     # Build a chronological possession sequence: for each frame with a
     # usable ball position, find its possessor among tracked players.
     players_by_frame = _build_players_by_frame(trajectories)
@@ -467,6 +485,15 @@ def _detect_events(match: Match, trajectories: dict, ball_trajectory: list[dict]
         possessor = get_ball_possessor(
             players_by_frame.get(frame_idx, []), ball_pos, ball_pt["homography_confidence"]
         )
+        # FIXED: ball_trajectory entries never carried player_id/team_id,
+        # so shot_heuristics.py's detect_shots() -- called below on this
+        # SAME ball_trajectory list -- always saw b1.get("player_id") as
+        # None. Every shot Event ever written had player_id=None,
+        # regardless of team assignment. Mutating ball_pt in place here
+        # (it's a reference into ball_trajectory, not a copy) fixes that
+        # at the source, before detect_shots() runs.
+        ball_pt["player_id"] = possessor["player_id"] if possessor else None
+        ball_pt["team_id"] = possessor["team_id"] if possessor else None
         if possessor is not None:
             possession_sequence.append({
                 "player_id": possessor["player_id"],
@@ -504,7 +531,7 @@ def _detect_events(match: Match, trajectories: dict, ball_trajectory: list[dict]
     _enrich_first_touch_metadata(first_touch_dicts, ball_trajectory, players_by_frame, deduped)
 
     all_event_dicts = first_touch_dicts + pass_dicts + turnover_dicts + shot_dicts
-    return [
+    event_rows = [
         Event(
             match_id=match.match_id,
             event_type=e["event_type"],
@@ -519,6 +546,13 @@ def _detect_events(match: Match, trajectories: dict, ball_trajectory: list[dict]
         )
         for e in all_event_dicts
     ]
+    # `deduped` (one entry per possession change, chronological) is
+    # returned alongside events -- decision_making_score needs per-touch
+    # decision time (next entry's timestamp minus this entry's), which
+    # isn't recoverable from the Event rows alone (a pass event's own
+    # timestamp is the RECEIVER's possession-start time, not the passer's
+    # release time -- see pass_heuristics.py's detect_passes()).
+    return event_rows, deduped
 
 
 def _enrich_first_touch_metadata(
@@ -549,11 +583,13 @@ def _enrich_first_touch_metadata(
                                          + (future["pitch_y_m"] - touch_pos[1]) ** 2) ** 0.5
 
         # Pressure: distance to nearest OTHER tracked player at this frame.
-        # NOTE: without team assignment (TEAM_ASSIGNMENT_CONFIDENCE == 0.0)
-        # we cannot distinguish "opponent" from "teammate" yet -- using
-        # nearest-other-player as a documented stand-in for
-        # nearest-opponent until jersey clustering ships. This is a known,
-        # stated approximation, not a silent one.
+        # NOTE: team_id is now real (see ai/computer_vision/tactical_analysis/
+        # team_assignment.py), but this function hasn't been upgraded to
+        # filter players_by_frame down to actual opponents (team_id !=
+        # this player's team_id) -- it still uses nearest-other-player as
+        # a stand-in for nearest-opponent. A known, stated approximation,
+        # not a silent one; upgrading it is a natural fast-follow now that
+        # real team splits exist, just out of scope for this pass.
         others = [p for p in players_by_frame.get(touch_frame, [])
                   if p["player_id"] != ev.get("player_id") and p["pitch_x_m"] is not None]
         if others and touch_pos[0] is not None:
@@ -574,11 +610,25 @@ def _enrich_first_touch_metadata(
         # silently substituting a plausible-looking constant.
 
 
-def _score_team_intelligence(match: Match, trajectories: dict) -> list[dict]:
-    """All team-level modules are gated on team_assignment_confidence,
-    which is 0.0 until jersey clustering ships (see TEAM_ASSIGNMENT_CONFIDENCE
-    at the top of this file) -- they will honestly report
-    low_upstream_confidence, not a guess."""
+def _score_team_intelligence(match: Match, trajectories: dict, team_assignment_confidence: float) -> list[dict]:
+    """All team-level modules are gated on team_assignment_confidence, now a
+    real per-run measurement from assign_teams() (Stage 1.5) instead of a
+    hardcoded constant -- they will honestly report low_upstream_confidence
+    only when that measured value is genuinely low.
+
+    Known, stated limitation (not silently building on top of it): the
+    confidence GATE is now real, but all_positions/frames_positions below
+    still pool EVERY tracked player regardless of team_id -- detect_formation/
+    compute_compactness/compute_formation_stability/compute_weak_zones
+    were deliberately not touched by team assignment (see backend/pipeline/
+    runner.py's Stage 1.5 comment), so a "confidence: normal" formation
+    reading means the CLUSTERING was confident, not that this specific
+    value was computed from a properly team-split subset of players.
+    Splitting these into genuine per-team passes (filtering by team_id
+    before calling each function, likely once per team) is a natural
+    fast-follow now that real team_id exists, but is out of scope for this
+    pass -- these 4 functions' call sites and inputs are intentionally
+    unchanged here."""
     all_positions = [
         (p.pitch_x_m, p.pitch_y_m)
         for points in trajectories.values()
@@ -589,14 +639,14 @@ def _score_team_intelligence(match: Match, trajectories: dict) -> list[dict]:
 
     formation = detect_formation(
         player_positions=all_positions[:10] if len(all_positions) >= 10 else all_positions,
-        team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE,
+        team_assignment_confidence=team_assignment_confidence,
     )
-    compactness = compute_compactness(all_positions, team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
-    stability = compute_formation_stability(frames_positions, team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
-    weak_zones = compute_weak_zones(all_positions, team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
+    compactness = compute_compactness(all_positions, team_assignment_confidence=team_assignment_confidence)
+    stability = compute_formation_stability(frames_positions, team_assignment_confidence=team_assignment_confidence)
+    weak_zones = compute_weak_zones(all_positions, team_assignment_confidence=team_assignment_confidence)
 
     defender_ball_distances = [[] for _ in frames_positions]  # requires possession/ball-side split -- see gate below
-    pressing = compute_pressing_intensity(defender_ball_distances, team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
+    pressing = compute_pressing_intensity(defender_ball_distances, team_assignment_confidence=team_assignment_confidence)
 
     return [formation, compactness, stability, weak_zones, pressing]
 
@@ -645,8 +695,8 @@ def _build_players_by_frame(trajectories: dict) -> dict[int, list[dict]]:
 def _nearest_other_player_distance(player_id: int, x: float, y: float, frame_others: list[dict]) -> float | None:
     """Distance to the closest OTHER tracked player at this frame. Same
     documented nearest-other-player-as-opponent-stand-in approximation as
-    _enrich_first_touch_metadata() uses, for the same reason
-    (TEAM_ASSIGNMENT_CONFIDENCE == 0.0 -- see module docstring)."""
+    _enrich_first_touch_metadata() uses -- not yet upgraded to filter by
+    real team_id (see that function's NOTE for why)."""
     others = [p for p in frame_others if p["player_id"] != player_id and p["pitch_x_m"] is not None]
     if not others:
         return None
@@ -669,14 +719,15 @@ def _compute_off_ball_inputs(player_id: int, points: list, players_by_frame: dic
         (separation gained), zero contribution on frames where the
         player closed distance instead of gaining it.
       - off_ball_frames_in_attacking_third / total_off_ball_frames_while_
-        team_in_possession: deliberately left at 0/0. Genuinely computing
-        this needs (a) team assignment, to know which players share this
-        player's team and which goal that team is attacking, and (b)
-        possession windows scoped to that team -- neither exists yet
-        (TEAM_ASSIGNMENT_CONFIDENCE == 0.0). Passing 0/0 makes
+        team_in_possession: deliberately left at 0/0. Team assignment now
+        exists (real team_id, see team_assignment.py), so (a) is
+        available; (b) -- possession windows scoped to a team -- still
+        isn't computed anywhere in this pipeline, so this sub-score isn't
+        wired up to real data yet either way. Passing 0/0 makes
         score_off_ball_movement()'s safe_ratio(..., default=None) return
         None for this sub-score honestly, rather than guessing a
-        plausible-looking count.
+        plausible-looking count. A natural fast-follow once team-scoped
+        possession windows exist, out of scope for this pass.
       - sample_size_phases: count of valid consecutive-frame pairs used
         for the space-creation computation above. A real, grounded
         number tied to actual measured data -- but an approximation of
@@ -720,19 +771,105 @@ def _compute_off_ball_inputs(player_id: int, points: list, players_by_frame: dic
     }
 
 
+def _compute_decision_times(possession_segments: list[dict]) -> dict[int, list[float]]:
+    """
+    One decision-time sample per touch = time until that touch's
+    possession segment ends (the next segment's timestamp minus this
+    one's) -- fed to score_decision_making()'s decision_speed sub-score,
+    same scale press_resistance_score already uses for its own
+    decision_speed. A player's LAST touch in the match/window has no
+    "next" entry to measure against and is dropped from their samples
+    entirely, not imputed -- same drop-not-impute convention as
+    _enrich_first_touch_metadata().
+    """
+    times: dict[int, list[float]] = {}
+    for i in range(len(possession_segments) - 1):
+        pid = possession_segments[i]["player_id"]
+        dt = possession_segments[i + 1]["timestamp"] - possession_segments[i]["timestamp"]
+        times.setdefault(pid, []).append(dt)
+    return times
+
+
+def _compute_passing_vision_inputs(
+    player_id: int, events_by_type_and_player: dict[str, dict[int, list[Event]]]
+) -> dict:
+    """
+    completed_passes / turnovers_lost: real event counts -- both only
+    classify correctly once team assignment (Stage 1.5) has run, which is
+    why score_passing_vision() gates on team_assignment_confidence rather
+    than treating these as always-safe inputs (see
+    ai/computer_vision/pass_detection/pass_heuristics.py's team1==team2
+    check).
+    pass_sector_counts: real, bucketed from each pass event's
+    metadata_json start_x/start_y -> Event.pitch_x_m/pitch_y_m via atan2,
+    into PASS_DIRECTION_SECTORS compass buckets.
+    forward_passes: real, using the SAME left_to_right attacking_direction
+    default already baked into shot_heuristics.py's detect_shots() -- not
+    a new simplification introduced here. That default is currently a
+    single global assumption with no per-match/per-half configuration
+    wired in anywhere in this pipeline, so a team's own passes played in
+    their defensive half (or second-half ends-swapped play) will be
+    silently mis-scored as "backward" by this same pre-existing
+    limitation. Flagging, not fixing, here -- out of scope for this pass.
+    """
+    passes = events_by_type_and_player.get("pass", {}).get(player_id, [])
+    turnovers_lost = events_by_type_and_player.get("turnover", {}).get(player_id, [])
+
+    sector_counts = [0] * PASS_DIRECTION_SECTORS
+    forward_passes = 0
+    for e in passes:
+        meta = e.metadata_json or {}
+        start_x, start_y = meta.get("start_x"), meta.get("start_y")
+        end_x, end_y = e.pitch_x_m, e.pitch_y_m
+        if start_x is None or start_y is None or end_x is None or end_y is None:
+            continue
+        angle = math.atan2(end_y - start_y, end_x - start_x)
+        sector = int(((angle + math.pi) / (2 * math.pi)) * PASS_DIRECTION_SECTORS) % PASS_DIRECTION_SECTORS
+        sector_counts[sector] += 1
+        if end_x > start_x:  # left_to_right attacking-direction assumption -- see docstring
+            forward_passes += 1
+
+    return {
+        "completed_passes": len(passes),
+        "turnovers_lost": len(turnovers_lost),
+        "pass_sector_counts": sector_counts,
+        "forward_passes": forward_passes,
+    }
+
+
+def _compute_finishing_inputs(
+    player_id: int, events_by_type_and_player: dict[str, dict[int, list[Event]]]
+) -> list[dict]:
+    """This player's shot events' real location/trajectory-projection
+    fields, for score_finishing_efficiency()'s per-shot loop."""
+    shots = events_by_type_and_player.get("shot", {}).get(player_id, [])
+    return [
+        {
+            "pitch_x_m": e.pitch_x_m,
+            "pitch_y_m": e.pitch_y_m,
+            "projected_y_at_goal": (e.metadata_json or {}).get("projected_y_at_goal"),
+        }
+        for e in shots
+    ]
+
+
 def _score_player_intelligence(
-    match: Match, trajectories: dict, events: list[Event], homography_confidence: float, fps: float
+    match: Match, trajectories: dict, events: list[Event], homography_confidence: float, fps: float,
+    team_assignment_confidence: float, possession_segments: list[dict],
 ):
     results = []
-    events_by_player: dict[int, list[dict]] = {}
+    events_by_type_and_player: dict[str, dict[int, list[Event]]] = {}
     for e in events:
-        if e.event_type == "first_touch" and e.player_id is not None:
-            events_by_player.setdefault(e.player_id, []).append({
-                "homography_confidence": e.homography_confidence,
-                "metadata_json": e.metadata_json,
-            })
+        if e.player_id is not None:
+            events_by_type_and_player.setdefault(e.event_type, {}).setdefault(e.player_id, []).append(e)
+
+    events_by_player: dict[int, list[dict]] = {
+        pid: [{"homography_confidence": e.homography_confidence, "metadata_json": e.metadata_json} for e in evs]
+        for pid, evs in events_by_type_and_player.get("first_touch", {}).items()
+    }
 
     players_by_frame = _build_players_by_frame(trajectories)
+    decision_times_by_player = _compute_decision_times(possession_segments)
 
     for player_id, points in trajectories.items():
         player_events = events_by_player.get(player_id, [])
@@ -742,15 +879,14 @@ def _score_player_intelligence(
         # Press Resistance and Defensive Positioning both require real
         # team-scoped aggregates (possessions under pressure, defensive
         # line deviation, etc.) that depend on knowing who's on which
-        # team. Until jersey clustering ships, call them with
-        # TEAM_ASSIGNMENT_CONFIDENCE=0.0 so they correctly self-report
-        # low_upstream_confidence rather than being skipped silently --
-        # the player still gets a (honestly null) row instead of just
-        # disappearing from the dashboard.
-        press_resistance = score_press_resistance(team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
+        # team -- team_assignment_confidence is now a real, per-run
+        # measurement from Stage 1.5 (assign_teams()), so these correctly
+        # report low_upstream_confidence only when that measurement is
+        # genuinely low, not unconditionally.
+        press_resistance = score_press_resistance(team_assignment_confidence=team_assignment_confidence)
         results.append((press_resistance, player_id))
 
-        defensive_positioning = score_defensive_positioning(team_assignment_confidence=TEAM_ASSIGNMENT_CONFIDENCE)
+        defensive_positioning = score_defensive_positioning(team_assignment_confidence=team_assignment_confidence)
         results.append((defensive_positioning, player_id))
 
         # FIXED (this pass): score_off_ball_movement() was previously
@@ -782,6 +918,37 @@ def _score_player_intelligence(
         tracked_duration_s = (points[-1].frame_id - points[0].frame_id) / fps if len(points) >= 2 else 0.0
         scanning = score_scanning_behavior(orientation_readings, tracked_duration_s=tracked_duration_s)
         results.append((scanning, player_id))
+
+        # Passing Vision / Decision Making: both gated on
+        # team_assignment_confidence, same reasoning as Press Resistance/
+        # Defensive Positioning above -- their real event counts only
+        # classify correctly once team_id is real (see
+        # _compute_passing_vision_inputs()'s docstring).
+        passing_inputs = _compute_passing_vision_inputs(player_id, events_by_type_and_player)
+        passing_vision = score_passing_vision(team_assignment_confidence=team_assignment_confidence, **passing_inputs)
+        results.append((passing_vision, player_id))
+
+        player_decision_times = decision_times_by_player.get(player_id, [])
+        avg_decision_time = (
+            sum(player_decision_times) / len(player_decision_times) if player_decision_times else None
+        )
+        n_pass = len(events_by_type_and_player.get("pass", {}).get(player_id, []))
+        n_shot = len(events_by_type_and_player.get("shot", {}).get(player_id, []))
+        n_turnover = len(events_by_type_and_player.get("turnover", {}).get(player_id, []))
+        decision_making = score_decision_making(
+            successful_actions=n_pass + n_shot,
+            lost_actions=n_turnover,
+            avg_decision_time=avg_decision_time,
+            team_assignment_confidence=team_assignment_confidence,
+        )
+        results.append((decision_making, player_id))
+
+        # Finishing Efficiency: gated on homography_confidence, NOT
+        # team_assignment_confidence -- shot location/attribution doesn't
+        # depend on team_id (see score_finishing_efficiency()'s docstring).
+        shots = _compute_finishing_inputs(player_id, events_by_type_and_player)
+        finishing = score_finishing_efficiency(shots=shots, homography_confidence=homography_confidence)
+        results.append((finishing, player_id))
 
     return results
 

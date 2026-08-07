@@ -15,17 +15,19 @@ from backend.database.session import get_db
 router = APIRouter(prefix="/api/tactical", tags=["tactical"])
 team_intel_router = APIRouter(prefix="/api/team_intelligence", tags=["team_intelligence"])
 
-# FIXED (Phase 3 audit): jersey-color clustering (team assignment) isn't
-# implemented yet -- backend/pipeline/runner.py honestly writes team-level
-# metrics under team_id="unassigned" rather than guessing "team-home" vs
-# "team-away" for frames it can't actually distinguish (see
-# TEAM_ASSIGNMENT_CONFIDENCE in that file). These endpoints used to default
-# to team_id="team-home", which meant they would never find the rows the
-# pipeline actually writes today -- an empty-looking dashboard that had
-# nothing to do with the pipeline having failed. Once team clustering
-# ships and starts writing real "team-home"/"team-away" splits, callers
-# can pass `?team_id=team-home` explicitly; until then, the default here
-# matches what the pipeline actually produces.
+# FIXED (Phase 3 audit): jersey-color clustering (team assignment, see
+# ai/computer_vision/tactical_analysis/team_assignment.py) is implemented,
+# but backend/pipeline/runner.py's _score_team_intelligence() still writes
+# team-level metrics under team_id="unassigned" -- formation/compactness/
+# etc. are computed by pooling ALL tracked players' positions regardless
+# of team_id (a deliberately out-of-scope limitation, see that function's
+# own docstring), not split into a genuine "team-home" pass and a
+# "team-away" pass. These endpoints used to default to team_id="team-home",
+# which meant they would never find the rows the pipeline actually writes
+# -- an empty-looking dashboard that had nothing to do with the pipeline
+# having failed. Once _score_team_intelligence() is split into real
+# per-team passes, callers can pass `?team_id=team-home` explicitly; until
+# then, the default here matches what the pipeline actually produces.
 DEFAULT_TEAM_SCOPE = "unassigned"
 
 

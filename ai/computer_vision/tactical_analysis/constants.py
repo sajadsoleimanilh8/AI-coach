@@ -43,6 +43,33 @@ SCANS_PER_MINUTE_TARGET = 8.0  # scans/min mapped to a 100 score; placeholder,
                                 # as NORMALIZATION_CONSTANT before judges see it
                                 # presented as anything but a relative ranking
 
+# Day 11 (team assignment / jersey-color clustering) new constants.
+# UNCALIBRATED STARTING POINT -- same caveat as SCANS_PER_MINUTE_TARGET/
+# IDEAL_SQUARENESS_DEG above: these are defensible starting values, not
+# numbers tuned against real broadcast footage yet. See
+# ai/computer_vision/tactical_analysis/team_assignment.py's module
+# docstring for the calibration procedure these should eventually go
+# through.
+TEAM_ASSIGNMENT_SAMPLE_STRIDE = 5  # every Nth frame is cropped/clustered; matches FRAME_PERSIST_STRIDE's default density
+TEAM_ASSIGNMENT_CROP_TOP_FRACTION = 0.5  # only the top half of a player bbox is sampled -- biases toward torso/jersey over shorts/socks/grass at the feet
+TEAM_ASSIGNMENT_MIN_USABLE_PIXELS = 40  # crops with fewer non-grass/non-skin pixels than this are discarded as unusable
+TEAM_ASSIGNMENT_KMEANS_MAX_ITERS = 50  # Lloyd's-algorithm iteration cap for the k=2 fit; bounds worst-case runtime, real fits converge well before this
+
+# OpenCV hue is 0-179 (not 0-359). Grass range: yellow-green to blue-green.
+GRASS_HUE_RANGE = (35, 85)
+GRASS_MIN_SATURATION = 40  # below this, treat as too desaturated to call "grass" -- avoids masking dark/shadowed jersey pixels that happen to fall in the green hue band
+GRASS_MIN_VALUE = 40
+
+# Skin tone wraps across the 0/179 hue boundary (red-adjacent), hence two ranges.
+SKIN_HUE_RANGES = ((0, 20), (170, 179))
+SKIN_SATURATION_RANGE = (20, 150)
+SKIN_MIN_VALUE = 60
+
+# Day 12 (passing vision / finishing efficiency) new constants.
+PASS_DIRECTION_SECTORS = 8  # compass buckets for pass-angle-diversity entropy; not yet calibrated against real distributions of pass angles
+SHOT_DISTANCE_TOLERANCE_M = 18.0  # ~edge-of-box; uncalibrated Gaussian tolerance for finishing_efficiency_score's distance sub-score, needs real-shot-data tuning
+MAX_REALISTIC_SHOOTING_ANGLE_DEG = 90.0  # angle at/beyond which sight-of-goal is treated as saturated to full score; uncalibrated placeholder
+
 # Body Orientation Score: "squareness" (0deg = shoulders parallel to the
 # pitch's long axis, i.e. facing straight down the pitch; 90deg = fully
 # side-on) mapped to a Gaussian centered on IDEAL_SQUARENESS_DEG. This

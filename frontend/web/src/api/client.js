@@ -74,4 +74,20 @@ export const api = {
   getPlayerMetrics(matchId, playerId) {
     return request(`/api/player_intelligence/${matchId}/${playerId}`);
   },
+
+  getTracking(matchId, startFrame, endFrame) {
+    const params = new URLSearchParams({ start_frame: String(startFrame) });
+    if (endFrame !== undefined && endFrame !== null) params.set('end_frame', String(endFrame));
+    return request(`/api/matches/${matchId}/tracking?${params.toString()}`);
+  },
+
+  getHeatmap(matchId, playerId) {
+    return request(`/api/matches/${matchId}/heatmap/${playerId}`);
+  },
+
+  // Not a JSON endpoint -- used directly as a <video> src, so it's a URL
+  // builder rather than something that goes through request().
+  getVideoUrl(videoId) {
+    return `${API_BASE}/api/videos/${videoId}/file`;
+  },
 };

@@ -1,0 +1,84 @@
+# GPU inference-worker override for the root docker-compose.yml.
+#
+# The base docker-compose.yml only runs `backend` (the FastAPI app) +
+# `postgres` -- there is no Celery worker anywhere in it, and no Redis
+# service either, despite backend/celery_app.py and backend/api/cache.py
+# both already reading REDIS_URL and defaulting to localhost:6379. That
+# means today, in the base compose file alone, `backend`'s calls to
+# process_video_job.delay() fail fast (by design -- see
+# broker_connection_retry=False in backend/celery_app.py) against a broker
+# that was never started, and no worker exists to run the job even if one
+# were. This file adds both missing pieces plus the GPU worker itself:
+#   - redis:   the broker/result-backend Celery and the metrics cache both
+#              expect, wired to `backend` via REDIS_URL.
+#   - inference-worker: the actual Celery worker (GPU), built from
+#              inference.Dockerfile, running backend/tasks.py::process_video_job.
+#
+# Run ALONGSIDE the base file, not instead of it -- Compose merges the two:
+#   docker compose -f docker-compose.yml -f deployment/docker/docker-compose.gpu.yml up --build
+#
+# Requires the NVIDIA Container Toolkit on the host (see deployment/docs.md)
+# for the `deploy.resources.reservations.devices` GPU request below to mean
+# anything -- without it, the container starts but CUDA init fails on the
+# first real job instead of at startup, since torch/ultralytics/mediapipe
+# only touch the GPU once a video actually reaches Stage 1.
+#
+# Use `docker compose` (the Docker CLI's v2 plugin), not the standalone
+# Python `docker-compose` v1 binary -- v1 generally ignores `deploy:`
+# outside Swarm mode, which means the GPU reservation silently never takes
+# effect and the worker falls back to (very slow) CPU inference with no
+# error telling you why.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: sports_strategy_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  inference-worker:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/inference.Dockerfile
+    container_name: sports_strategy_inference_worker
+    environment:
+      DATABASE_URL: postgresql+psycopg2://sports:sports@postgres:5432/sports_strategy
+      REDIS_URL: redis://redis:6379/0
+      # Placeholder path -- override in a real deploy with whatever
+      # checkpoint is actually on the GPU host. *.pt files are gitignored
+      # (see .gitignore's "ML artifacts" section), so this file is never
+      # baked into the image; it must exist on the host and be mounted in,
+      # same as the `models` volume below.
+      YOLO_MODEL_PATH: /app/models/yolo/yolov8s.pt
+      CALIBRATION_DIR: /app/calibrations
+    volumes:
+      # Shared with `backend`: the worker reads Video.storage_path files
+      # that upload_video() (backend/api/main.py) wrote to this same
+      # directory -- without sharing this volume, every job would fail
+      # with PipelineAssetError("Video file not found on disk").
+      - ../../storage:/app/storage
+      - ../../calibrations:/app/calibrations
+      - ../../models:/app/models:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

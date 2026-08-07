@@ -1,0 +1,26 @@
+# CV/ML runtime deps for the GPU inference worker
+# (deployment/docker/inference.Dockerfile). This is deliberately NOT the
+# same file as "ai/computer_vision/player detection/requirements.txt" --
+# that one is a dev/training kitchen sink (langchain, chromadb, openai,
+# streamlit, wandb, mlflow, ...) for notebooks and training scripts, none
+# of which backend/pipeline/runner.py::run_pipeline() touches at inference
+# time. Shipping that whole file into the worker image would multiply
+# build time and image size for dependencies this container never imports.
+#
+# torch/torchvision are NOT listed here -- the base image in
+# inference.Dockerfile (pytorch/pytorch:*-cuda*-cudnn*-runtime) already
+# ships a CUDA-matched build. Installing them again from PyPI here (without
+# pinning to the same CUDA wheel index) risks silently resolving a
+# CPU-only wheel and losing the GPU build the base image gives you for
+# free.
+ultralytics
+opencv-python-headless
+mediapipe
+scipy
+numpy
+
+# backend.celery_app / backend.tasks / backend.database.session /
+# backend.api.cache (imported by backend.tasks) need celery, redis,
+# sqlalchemy, psycopg2-binary, pydantic -- same file the API container
+# installs from, so worker and API never drift on these versions.
+-r ../../backend/requirements.txt

@@ -14,13 +14,23 @@ from backend.database.session import get_db
 
 router = APIRouter(prefix="/api/player_intelligence", tags=["player_intelligence"])
 
-PLAYER_NAME_MAP = {
-    10: "Alex Morgan",
-    7: "Marcus Rashford",
-    4: "Virgil van Dijk",
-    9: "Erling Haaland",
-    8: "Kevin De Bruyne",
-}
+# FIXED: PLAYER_NAME_MAP used to map raw ByteTrack player_id -> a
+# celebrity name (Alex Morgan, Marcus Rashford, etc.) for ANY real match,
+# not just demo data. player_id is a ByteTrack tracking ID scoped to a
+# single video, not a resolved player identity (see
+# docs/database_schema.md's own note on PlayerDetection.player_id, and
+# ai/computer_vision/player_tracking/tracker.py's TrackedDetection
+# docstring) -- there is no jersey-number OCR or Re-ID in this pipeline,
+# so there is no legitimate way to know that track_id 10 is actually
+# Alex Morgan in a real uploaded match. Presenting a fabricated identity
+# as if it were resolved is exactly the "confident-looking garbage"
+# failure mode docs/data analysis.md's own honesty principles warn
+# against -- it previously showed a real, unidentified tracked player
+# under a real athlete's name on the dashboard for any real match. Demo
+# data (frontend/web/src/api/mockClient.js) is free to use illustrative
+# names since the UI clearly labels it "Demo data" (see
+# TabPlayerIntelligence.jsx's isDemo banner) -- that's disclosed
+# fiction, this endpoint serving it as fact for real matches was not.
 
 
 @router.get("/{match_id}/{player_id}", response_model=list[PlayerMetricResponse])
@@ -85,7 +95,11 @@ def get_all_player_intelligence(match_id: str, db: Session = Depends(get_db)):
     results = [
         {
             "player_id": pid,
-            "player_name": PLAYER_NAME_MAP.get(pid, f"Player #{pid}"),
+            # No name resolution exists for real tracked players -- see the
+            # module-level comment above for why this must not be a
+            # celebrity name lookup. "Player #N" honestly reflects that
+            # this is a tracking ID, not a resolved identity.
+            "player_name": f"Player #{pid}",
             "metrics": m_list,
         }
         for pid, m_list in grouped.items()

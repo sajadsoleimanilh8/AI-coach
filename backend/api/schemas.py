@@ -72,6 +72,49 @@ class PlayerIntelligenceResponse(BaseModel):
     player_name: str | None = None
     metrics: list[PlayerMetricResponse]
 
+class TrackedPlayerPoint(BaseModel):
+    player_id: int
+    team_id: str | None = None
+    pixel_x: float
+    pixel_y: float
+    pitch_x_m: float | None = None
+    pitch_y_m: float | None = None
+
+class TrackedBallPoint(BaseModel):
+    pixel_x: float
+    pixel_y: float
+
+class TrackingFrame(BaseModel):
+    frame_number: int
+    timestamp: float
+    players: list[TrackedPlayerPoint]
+    ball: TrackedBallPoint | None = None
+
+class TrackingWindowResponse(BaseModel):
+    match_id: str
+    start_frame: int
+    end_frame: int
+    fps: float
+    frames: list[TrackingFrame]
+
+class HeatmapCell(BaseModel):
+    grid_x: int
+    grid_y: int
+    count: int
+    density: float  # count / max_count in this grid, 0..1
+
+class HeatmapResponse(BaseModel):
+    match_id: str
+    player_id: int
+    grid_cols: int
+    grid_rows: int
+    pitch_length_m: float
+    pitch_width_m: float
+    cells: list[HeatmapCell]
+    confidence: str
+    sample_size: int
+    usable_sample_size: int
+
 class PipelineStageTiming(BaseModel):
     """One row of a real, measured pipeline run -- see backend/pipeline/latency.py.
     Never hand-typed: every instance of this model in the system is produced

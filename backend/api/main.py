@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import Annotated
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from backend.api import player_intelligence, tactical
+from backend.api import player_intelligence, tactical, tracking
 from backend.api.schemas import (
     AnalysisResultCreate,
     AnalysisResultResponse,
@@ -68,6 +69,7 @@ app.add_middleware(
 app.include_router(tactical.router)
 app.include_router(tactical.team_intel_router)
 app.include_router(player_intelligence.router)
+app.include_router(tracking.router)
 
 
 @app.on_event("startup")
@@ -164,6 +166,21 @@ def upload_video(
         status=job.status.value,
         message=job.message or "Video uploaded.",
     )
+
+
+@app.get("/api/videos/{video_id}/file")
+def get_video_file(video_id: str, db: Session = Depends(get_db)):
+    """Streams the raw uploaded clip back for the tracking-overlay player
+    (see TabMatchAnalysis.jsx) -- the video is written to disk at upload
+    time (see upload_video() above), before the pipeline ever runs, so
+    this is available immediately and independent of processing status."""
+    video = db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    storage_path = Path(video.storage_path)
+    if not storage_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video file missing on disk")
+    return FileResponse(storage_path, media_type=video.content_type or "video/mp4")
 
 
 @app.get("/api/processing/{job_id}", response_model=ProcessingStatusResponse)
